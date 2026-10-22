@@ -1,0 +1,29 @@
+services:
+  9router:
+    image: ${NINEROUTER_IMAGE:-decolua/9router:latest}
+    container_name: 9router
+    restart: unless-stopped
+    ports:
+      - "${NINEROUTER_BIND:-127.0.0.1}:${NINEROUTER_PORT:-20128}:20128"
+    environment:
+      NODE_ENV: production
+      PORT: 20128
+      HOSTNAME: 0.0.0.0
+      DATA_DIR: /app/data
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      INITIAL_PASSWORD: ${INITIAL_PASSWORD:?set INITIAL_PASSWORD in .env}
+      API_KEY_SECRET: ${API_KEY_SECRET:-endpoint-proxy-api-key-secret}
+      MACHINE_ID_SALT: ${MACHINE_ID_SALT:-endpoint-proxy-salt}
+      BASE_URL: ${BASE_URL:-http://localhost:20128}
+      NEXT_PUBLIC_BASE_URL: ${BASE_URL:-http://localhost:20128}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      REQUIRE_API_KEY: ${REQUIRE_API_KEY:-false}
+      ENABLE_REQUEST_LOGS: ${ENABLE_REQUEST_LOGS:-false}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:20128/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
