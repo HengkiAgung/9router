@@ -52,7 +52,17 @@ trap 'rm -f "$TMP"' EXIT
   echo "KANTOR_PORT=$PORT"
   echo "KANTOR_DATA_DIR=/var/lib/kantor"
   echo "KANTOR_PROJECTS_DIR=/home/kantor/projects"
-  grep -E '^KANTOR_(MAX_|MIN_|AUTO_|MODELS=|DEFAULT_MODEL=|FALLBACK_MODELS=|COOKIE_SECURE=)' "$ENV_FILE" || true
+  # Every other KANTOR_* setting, double-quoted for systemd (notes hold spaces and ";").
+  python3 -I - "$ENV_FILE" <<'PY'
+import re, sys
+skip = {"KANTOR_PASSWORD", "KANTOR_DOMAIN", "KANTOR_PORT", "KANTOR_BASE_URL", "KANTOR_DATA_DIR",
+        "KANTOR_PROJECTS_DIR", "KANTOR_MEMORY_MAX_MB", "KANTOR_MEMORY_HIGH_MB"}
+for line in open(sys.argv[1], encoding="utf-8"):
+    m = re.match(r"(KANTOR_[A-Z_]+)=(.*)$", line.rstrip("\n"))
+    if m and m.group(1) not in skip:
+        value = m.group(2).replace("\\", "\\\\").replace('"', '\\"')
+        print(f'{m.group(1)}="{value}"')
+PY
 } > "$TMP"
 sudo install -d -m 700 /etc/kantor
 sudo install -m 600 -o root -g root "$TMP" /etc/kantor/kantor.env

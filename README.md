@@ -57,6 +57,7 @@ Config: `NINEROUTER_API_KEY` (and optional `ORCH_BASE_URL`, `ORCH_MODELS`) from 
 ## Kantor (multi-agent office)
 A team of AI workers that hire, message, wait for and dismiss each other, on top of 9router. Live at https://myoffice.hengkiagung.my.id (password: `KANTOR_PASSWORD` in `.env`).
 - Hire a worker from the web UI with a task. A big task can be split: the worker hires others (`hire_worker`), each in its own git worktree and branch `kantor/<name>`, waits for their reports (`wait_for_workers`), merges their branches and reports. Also `tell_worker`, `list_workers`, `send_home`.
+- Models by difficulty (judged automatically, or set by the hiring worker): `KANTOR_MODEL_EASY/NORMAL/HARD`. When a model fails: `KANTOR_FALLBACK_MODELS`, then `KANTOR_CHEAP_MODELS` with a warning in the UI. `KANTOR_PAID_MODELS` are never automatic: an agent must justify one and you approve it; paid tokens are counted in the header.
 - Workers are threads (about 2 MB each), not agent CLIs; model calls and commands are gated by the `KANTOR_*` limits in `.env` (sized for this 2 GB server).
 - File edits apply directly; shell commands wait for approval in the UI, except read-only ones (`ls`, `cat`, `grep`, `git status/diff/log`).
 - Code: `tools/kantor/` (`engine.py`, `server.py`, `ui.html`). Install or update, after changing code or `.env`: `bash tools/kantor/deploy.sh`.

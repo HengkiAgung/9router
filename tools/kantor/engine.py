@@ -30,12 +30,28 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from orchestrator import LLM, MAX_TOOL_RESULT, TOOL_SPECS, Workspace, tool_spec  # noqa: E402
 
-DEFAULT_MODELS = {
-    "ag/claude-sonnet-4-6": "strongest coder; planning, hard bugs, reviews",
-    "ag/gemini-3.8-flash": "fast and cheap; simple edits, searches, summaries",
-    "ag/gemini-3.1-pro-high": "strong reasoning; architecture and planning",
-    "kenari/qwen3-8-27b:free": "free but slow; plain text, docs, explanations",
+# What each model is good for, shown to agents and in the UI (KANTOR_MODEL_NOTES replaces it).
+# Checked against this 9router on 2026-11-03: all answer with tool calls.
+MODEL_NOTES = {
+    "ag/gemini-3.8-flash": "fast; simple edits, searches, summaries",
+    "ag/claude-sonnet-4-6": "strong coder; most features and bugs",
+    "ag/claude-opus-4-6-thinking": "strongest free model; architecture, hard bugs, reviews",
+    "ollama/gpt-oss:120b": "solid open model on another provider (Ollama free plan)",
+    "ollama/gemma4:31b": "small open model (Ollama free plan)",
+    "kenari/glm-4-7-flash:free": "free, quick, weak",
+    "kenari/qwen3-8-27b:free": "free, sometimes very slow",
 }
+DIFFICULTIES = ("easy", "normal", "hard")
+
+
+def parse_pairs(text: str) -> dict[str, str]:
+    """"model=note;model=note" -> {model: note}."""
+    out = {}
+    for item in (text or "").split(";"):
+        model, _, note = item.partition("=")
+        if model.strip():
+            out[model.strip()] = note.strip()
+    return out
 NAMES = ["Ani", "Budi", "Citra", "Dodi", "Eka", "Fajar", "Gita", "Hadi", "Intan", "Joko", "Kiki",
          "Lina", "Made", "Nina", "Oki", "Putu", "Rina", "Sari", "Tono", "Udin", "Wati", "Yanto"]
 
@@ -111,17 +127,27 @@ class Config:
         self.auto_approve = flag("KANTOR_AUTO_APPROVE_COMMANDS", False)
         self.data_dir = Path(env.get("KANTOR_DATA_DIR") or Path.home() / ".kantor")
         self.projects_dir = Path(env.get("KANTOR_PROJECTS_DIR") or Path.home() / "projects")
-        # KANTOR_MODELS="model=what it is good at;model=..." replaces DEFAULT_MODELS.
-        self.models = dict(DEFAULT_MODELS)
-        if env.get("KANTOR_MODELS"):
-            self.models = {}
-            for item in env["KANTOR_MODELS"].split(";"):
-                model, _, desc = item.partition("=")
-                if model.strip():
-                    self.models[model.strip()] = desc.strip()
-        self.default_model = env.get("KANTOR_DEFAULT_MODEL") or next(iter(self.models))
-        self.fallback_models = [m.strip() for m in env.get(
-            "KANTOR_FALLBACK_MODELS", "ag/claude-sonnet-4-6,ag/gemini-3.8-flash").split(",") if m.strip()]
+        def models(key: str, default: str) -> list[str]:
+            return [m.strip() for m in (env.get(key) or default).split(",") if m.strip()]
+
+        # A worker's model comes from its task's difficulty, unless someone names one.
+        self.tiers = {
+            "easy": env.get("KANTOR_MODEL_EASY") or "ag/gemini-3.8-flash",
+            "normal": env.get("KANTOR_MODEL_NORMAL") or env.get("KANTOR_DEFAULT_MODEL") or "ag/claude-sonnet-4-6",
+            "hard": env.get("KANTOR_MODEL_HARD") or "ag/claude-opus-4-6-thinking",
+        }
+        self.default_model = self.tiers["normal"]
+        self.classifier_model = env.get("KANTOR_CLASSIFIER_MODEL") or self.tiers["easy"]
+        # Tried in order when a worker's own model fails.
+        self.fallback_models = models("KANTOR_FALLBACK_MODELS", "ag/claude-sonnet-4-6,ollama/gpt-oss:120b")
+        # Last resort when every model above fails (usually limits): weaker, so the UI warns.
+        self.cheap_models = models("KANTOR_CHEAP_MODELS",
+                                   "ollama/gemma4:31b,kenari/glm-4-7-flash:free,kenari/qwen3-8-27b:free")
+        # Never used automatically; an agent must justify one and the user must approve it.
+        self.paid_models = parse_pairs(env.get("KANTOR_PAID_MODELS", ""))
+        notes = parse_pairs(env["KANTOR_MODEL_NOTES"]) if env.get("KANTOR_MODEL_NOTES") else MODEL_NOTES
+        self.models = {m: notes.get(m, "") for m in
+                       [*self.tiers.values(), *self.fallback_models, *self.cheap_models] if m not in self.paid_models}
 
 
 class Events:
@@ -166,6 +192,11 @@ class Store:
             create index if not exists events_worker on events(worker, id);
             create table if not exists sessions(hash text primary key, expires real);
         """)
+        for column in ("usage text", "last_model text"):  # added after the first release
+            try:
+                self.conn.execute(f"alter table workers add column {column}")
+            except sqlite3.OperationalError:
+                pass
 
     def q(self, sql: str, args: tuple = ()) -> list:
         with self.lock:
@@ -276,9 +307,17 @@ TEAM_SPECS = {
         "worktree and branch (kantor/<name>) cut from your current commit. Give it everything it needs: "
         "it cannot see your conversation.",
         {"task": {"type": "string", "description": "The complete, self-contained task."},
-         "model": {"type": "string", "description": "One of the office's models; default is the office's."},
+         "difficulty": {"type": "string", "enum": list(DIFFICULTIES),
+                        "description": "Picks the model tier. Left out, the office judges it from the task."},
+         "model": {"type": "string", "description": "A specific model instead of the difficulty's."},
+         "justification": {"type": "string", "description": "Required for a paid model: why the free "
+                           "tiers are not enough for this task."},
          "name": {"type": "string", "description": "Optional name."}},
         ["task"]),
+    "switch_model": tool_spec(
+        "switch_model", "Change the model you run on, from your next step. A paid model needs a justification "
+        "and the user's approval.",
+        {"model": {"type": "string"}, "justification": {"type": "string"}}, ["model"]),
     "tell_worker": tool_spec("tell_worker", "Send a message to another worker; it handles it as its next "
                              "prompt (a finished worker starts again with it).",
                              {"worker": {"type": "string"}, "message": {"type": "string"}}, ["worker", "message"]),
@@ -312,6 +351,9 @@ class Worker:
         self.report: str = row.get("report") or ""
         self.history: list[dict] = row.get("history") or []
         self.created: float = row.get("created") or time.time()
+        self.usage: dict[str, int] = row.get("usage") or {}  # tokens per model
+        self.last_model: str | None = row.get("last_model")
+        self.model_note = ""  # how its model was picked, for the hirer
         self.inbox: deque[tuple[str, str]] = deque()
         self.cond = threading.Condition()
         self.cancel = threading.Event()
@@ -326,15 +368,18 @@ class Worker:
         parent = self.office.workers.get(self.parent) if self.parent else None
         return {"id": self.id, "name": self.name, "project": self.project, "branch": self.branch,
                 "cwd": self.cwd, "parent": parent.name if parent else None, "depth": self.depth,
-                "model": self.model, "status": self.status, "task": clip(self.task, 400),
-                "report": clip(self.report, 3000), "created": self.created, "inbox": len(self.inbox)}
+                "model": self.model, "paid": self.model in self.office.cfg.paid_models,
+                "last_model": self.last_model, "usage": self.usage, "status": self.status,
+                "task": clip(self.task, 400), "report": clip(self.report, 3000), "created": self.created,
+                "inbox": len(self.inbox)}
 
     def save(self) -> None:
         self.office.db.q(
             "insert or replace into workers(id, name, project, cwd, branch, parent, depth, model, status, "
-            "task, report, history, created) values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "task, report, history, created, usage, last_model) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.id, self.name, self.project, self.cwd, self.branch, self.parent, self.depth, self.model,
-             self.status, self.task, self.report, json.dumps(self.history), self.created))
+             self.status, self.task, self.report, json.dumps(self.history), self.created,
+             json.dumps(self.usage), self.last_model))
 
     def set_status(self, status: str) -> None:
         if status == self.status:
@@ -418,7 +463,15 @@ class Worker:
     def _system_prompt(self) -> str:
         cfg = self.office.cfg
         parent = self.office.workers.get(self.parent) if self.parent else None
-        models = "\n".join(f"  - {m}: {d}" for m, d in cfg.models.items())
+        tiers = "\n".join(f"  - {d}: {m} ({cfg.models.get(m, '')})" for d, m in cfg.tiers.items())
+        paid = "\n".join(f"  - {m}: {n}" for m, n in cfg.paid_models.items()) or "  (none configured)"
+        models = (f"Give each worker you hire a difficulty, which picks its model:\n{tiers}\n"
+                  f"Other models you may name instead: {', '.join(cfg.models)}.\n"
+                  f"Paid models, which cost the user money:\n{paid}\n"
+                  "Use a paid model only when the task truly needs it: the hard tier already failed at it, or "
+                  "it is critical and beyond the hard tier. Name it with a justification of why the free "
+                  "tiers are not enough; the user must approve it. If they don't, carry on with the hard "
+                  "tier. switch_model changes your own model the same way.")
         can_hire = self.depth < cfg.max_depth
         lines = [
             f"You are {self.name}, a worker in Kantor, a small office of AI agents that build software together.",
@@ -428,13 +481,13 @@ class Worker:
             "report (git add -A && git commit -m ...), so whoever hired you can merge it." if self.branch else
             "You work directly in the project's main checkout.",
             "",
-            "Team tools: list_workers, hire_worker, tell_worker, wait_for_workers, send_home.",
+            "Team tools: list_workers, hire_worker, tell_worker, wait_for_workers, send_home, switch_model.",
             "Do a small task yourself. Split a big task into independent parts and hire one worker per part "
             f"(at most {cfg.max_active} think at once; the rest queue), then wait_for_workers, review their "
             "branches (git log/diff kantor/<name>), merge them into your checkout with run_command, run the "
             "tests, send them home, and report." if can_hire else
             "You cannot hire workers (the hiring depth limit is reached); do the task yourself.",
-            "Models you can give a worker you hire:", models,
+            models,
             "",
             "Shell commands need the user's approval unless they only read (ls, cat, grep, git status/diff/log).",
             "Heavy commands (npm, node, builds, pip, docker) queue one at a time: the server has little RAM.",
@@ -557,10 +610,11 @@ class Office:
 
     def _load(self) -> None:
         cols = ["id", "name", "project", "cwd", "branch", "parent", "depth", "model", "status", "task",
-                "report", "history", "created"]
+                "report", "history", "created", "usage", "last_model"]
         for values in self.db.q(f"select {', '.join(cols)} from workers order by created"):
             row = dict(zip(cols, values))
             row["history"] = json.loads(row["history"] or "[]")
+            row["usage"] = json.loads(row["usage"] or "{}")
             if row["status"] != "home":
                 row["status"] = "idle" if row["status"] in BUSY else row["status"]
             w = Worker(self, row)
@@ -592,6 +646,12 @@ class Office:
             "projects": self.projects(),
             "models": self.cfg.models,
             "default_model": self.cfg.default_model,
+            "tiers": self.cfg.tiers,
+            "fallback_models": self.cfg.fallback_models,
+            "cheap_models": self.cfg.cheap_models,
+            "paid_models": self.cfg.paid_models,
+            "paid_tokens": sum(n for w in self.workers.values() for m, n in w.usage.items()
+                               if m in self.cfg.paid_models),
             "limits": {"max_workers": self.cfg.max_workers, "max_active": self.cfg.max_active,
                        "max_commands": self.cfg.max_commands, "max_heavy": self.cfg.max_heavy,
                        "max_depth": self.cfg.max_depth, "min_free_mb": self.cfg.min_free_mb},
@@ -609,26 +669,97 @@ class Office:
             if mem_available_mb() >= self.cfg.min_free_mb:
                 worker.set_status(before if before != "waiting_memory" else "working")
 
+    def _call(self, worker: Worker, model: str, messages: list, tools: list | None, final: bool,
+              errors: list) -> dict | None:
+        body = {"model": model, "messages": messages, "stream": False}
+        if tools:
+            body["tools"] = tools
+            if final:
+                body["tool_choice"] = "none"
+        with worker.waiting(self.active_gate, "queued"):
+            self.wait_for_memory(worker)
+            if worker.cancel.is_set():
+                raise RuntimeError("stopped by the user")
+            try:
+                data = self.llm._post(body)
+                msg = data["choices"][0]["message"]
+            except Exception as e:
+                errors.append(f"{model}: {clip(str(e), 200)}")
+                self.events.emit(worker.id, "error", f"{model} failed: {clip(str(e), 300)}")
+                return None
+        usage = data.get("usage") or {}
+        tokens = usage.get("total_tokens") or (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))
+        worker.usage[model] = worker.usage.get(model, 0) + int(tokens or 0)
+        return msg
+
     def chat(self, worker: Worker, messages: list, tools: list, final: bool = False) -> dict:
-        models = [worker.model] + [m for m in self.cfg.fallback_models if m != worker.model]
-        errors = []
+        """The worker's model, then the fallbacks (twice, since limits often clear in seconds), then
+        the cheap models with a warning. Paid models are never a fallback."""
+        primary = [worker.model] + [m for m in self.cfg.fallback_models if m != worker.model]
+        cheap = [m for m in self.cfg.cheap_models if m not in primary]
+        errors: list[str] = []
         for attempt in range(2):
-            for model in models:
-                body = {"model": model, "messages": messages, "tools": tools, "stream": False}
-                if final:
-                    body["tool_choice"] = "none"
-                with worker.waiting(self.active_gate, "queued"):
-                    self.wait_for_memory(worker)
-                    if worker.cancel.is_set():
-                        raise RuntimeError("stopped by the user")
-                    try:
-                        return self.llm._post(body)["choices"][0]["message"]
-                    except Exception as e:
-                        errors.append(f"{model}: {clip(str(e), 200)}")
-                        self.events.emit(worker.id, "error", f"{model} failed: {clip(str(e), 300)}")
+            for model in primary:
+                msg = self._call(worker, model, messages, tools, final, errors)
+                if msg is not None:
+                    if worker.last_model in cheap:
+                        self.events.emit(worker.id, "notice", f"{worker.name} is back on {model}")
+                    worker.last_model = model
+                    return msg
             if attempt == 0:
-                time.sleep(15)  # Antigravity locks a model for a few seconds after bursts
+                worker.cancel.wait(15)  # Antigravity locks a model for a few seconds after bursts
+        for model in cheap:
+            msg = self._call(worker, model, messages, tools, final, errors)
+            if msg is not None:
+                if worker.last_model != model:
+                    self.events.emit(worker.id, "warning",
+                                     f"{worker.name}: {worker.model} and the fallbacks all failed (likely limits). "
+                                     f"Using the cheap backup {model} for now; expect weaker work.",
+                                     {"model": model})
+                worker.last_model = model
+                return msg
         raise RuntimeError("every model failed: " + " | ".join(errors[-4:]))
+
+    def classify(self, task: str) -> str:
+        """Judge a task's difficulty with the classifier model; "normal" when unsure."""
+        prompt = ("Rate how hard this software task is for an AI coding agent. easy: small and mechanical, "
+                  "one place, clear fix. normal: a typical feature or bug across a few files. hard: "
+                  "architecture, tricky debugging, concurrency, security, a large refactor, or unclear "
+                  "requirements. Answer with one word: easy, normal or hard.\n\nTask:\n" + task[:4000])
+        try:
+            with self.active_gate:
+                data = self.llm._post({"model": self.cfg.classifier_model, "stream": False,
+                                       "messages": [{"role": "user", "content": prompt}]})
+            m = re.search(r"\b(easy|normal|hard)\b", (data["choices"][0]["message"].get("content") or "").lower())
+            return m.group(1) if m else "normal"
+        except Exception:
+            return "normal"
+
+    def pick_model(self, task: str, hirer: Worker | None, model: str | None, difficulty: str | None,
+                   justification: str | None) -> tuple[str, str]:
+        """(model, note). A paid model named by an agent needs a justification and the user's approval;
+        the user naming one in the UI is the approval."""
+        cfg = self.cfg
+        if model:
+            if model in cfg.paid_models:
+                if hirer is None:
+                    return model, f"paid model {model}, chosen by the user"
+                if len((justification or "").strip()) < 30:
+                    raise TeamError("a paid model needs a justification (at least 30 characters): why the "
+                                    "free tiers are not enough for this task")
+                title = f"{hirer.name} wants paid model {model}"
+                detail = f"Why:\n{justification.strip()}\n\nFor this task:\n{task}"
+                if self.request_approval(hirer, "paid_model", title, detail):
+                    return model, f"paid model {model}, approved by the user"
+                return cfg.tiers["hard"], f"the user declined {model}; using the hard tier, {cfg.tiers['hard']}"
+            if model not in cfg.models:
+                raise TeamError(f"model is one of: {', '.join(cfg.models)}"
+                                + (f"; paid, with approval: {', '.join(cfg.paid_models)}" if cfg.paid_models else ""))
+            return model, f"model {model}, chosen by name"
+        if difficulty not in DIFFICULTIES:
+            difficulty = self.classify(task)
+            return cfg.tiers[difficulty], f"judged {difficulty} -> {cfg.tiers[difficulty]}"
+        return cfg.tiers[difficulty], f"{difficulty} -> {cfg.tiers[difficulty]}"
 
     def request_approval(self, worker: Worker, kind: str, title: str, detail: str) -> bool:
         aid = uuid.uuid4().hex[:10]
@@ -692,12 +823,16 @@ class Office:
         return str(path), branch
 
     def hire(self, project: str, task: str, parent: Worker | None = None, name: str | None = None,
-             model: str | None = None) -> Worker:
+             model: str | None = None, difficulty: str | None = None,
+             justification: str | None = None) -> Worker:
         task = (task or "").strip()
         if not task:
             raise TeamError("give the worker its task")
-        if model and model not in self.cfg.models:
-            raise TeamError(f"model is one of: {', '.join(self.cfg.models)}")
+        if len(self.present()) >= self.cfg.max_workers:  # checked again below; this avoids a pointless approval
+            raise TeamError(f"the office is full ({self.cfg.max_workers} workers, KANTOR_MAX_WORKERS); "
+                            "send someone home first")
+        # Before taking the lock: this may wait for the user to approve a paid model.
+        model, model_note = self.pick_model(task, parent, model, difficulty, justification)
         with self.lock:
             if len(self.present()) >= self.cfg.max_workers:
                 raise TeamError(f"the office is full ({self.cfg.max_workers} workers, KANTOR_MAX_WORKERS); "
@@ -724,12 +859,14 @@ class Office:
                     cwd, branch = tree
             w = Worker(self, {"id": uuid.uuid4().hex[:10], "name": name, "project": project_dir.name,
                               "cwd": cwd, "branch": branch, "parent": parent.id if parent else None,
-                              "depth": depth, "model": model or self.cfg.default_model, "status": "idle",
+                              "depth": depth, "model": model, "status": "idle",
                               "task": task, "created": time.time()})
             self.workers[w.id] = w
             w.save()
             w.start()
+        w.model_note = model_note
         self.events.emit(w.id, "status", "hired", w.row())
+        self.events.emit(w.id, "notice", f"Model: {model_note}")
         w.send(parent.name if parent else "user", task)
         return w
 
@@ -787,10 +924,23 @@ class Office:
                         f"  task: {clip(r['task'], 200)}\n  last report: {clip(r['report'], 300) or '-'}")
         return "\n".join(rows)
 
-    def tool_hire_worker(self, me: Worker, task: str, model: str | None = None, name: str | None = None) -> str:
-        w = self.hire(me.project, task, parent=me, name=name, model=model)
-        return (f"Hired {w.name} (model {w.model}, branch {w.branch or 'shared checkout'}). It is working now; "
-                "call wait_for_workers to get its report.")
+    def tool_hire_worker(self, me: Worker, task: str, difficulty: str | None = None, model: str | None = None,
+                         justification: str | None = None, name: str | None = None) -> str:
+        w = self.hire(me.project, task, parent=me, name=name, model=model, difficulty=difficulty,
+                      justification=justification)
+        return (f"Hired {w.name} on {w.model} ({w.model_note}), branch {w.branch or 'shared checkout'}. "
+                "It is working now; call wait_for_workers to get its report.")
+
+    def tool_switch_model(self, me: Worker, model: str, justification: str | None = None) -> str:
+        if model == me.model:
+            return f"You already run on {model}."
+        new, note = self.pick_model(me.task, me, model, None, justification)
+        if new != model:
+            return f"Not switched: {note}. You stay on {me.model}."
+        me.model = new
+        me.save()
+        self.events.emit(me.id, "model", f"{me.name} now runs on {new} ({note})", me.row())
+        return f"Switched to {new}; it takes effect from your next step."
 
     def tool_tell_worker(self, me: Worker, worker: str, message: str) -> str:
         target = self.find(worker)

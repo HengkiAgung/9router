@@ -43,6 +43,13 @@ header .stats { display: flex; gap: 14px; color: var(--muted); font-size: 13px; 
 .approval .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .approval .title { flex: 1; min-width: 200px; }
 .approval pre { background: var(--code); padding: 8px; border-radius: 6px; margin-top: 8px; max-height: 300px; overflow: auto; }
+.approval.paid { border-color: var(--bad); border-left-color: var(--bad); }
+#warnings { padding: 0 16px; }
+.warning { display: flex; gap: 10px; align-items: center; background: var(--panel); border: 1px solid var(--line);
+  border-left: 4px solid var(--warn); border-radius: 8px; padding: 8px 12px; margin-top: 12px; font-size: 13.5px; }
+.warning span { flex: 1; }
+.ev.warning { color: var(--warn); }
+.ev.notice { color: var(--muted); font-size: 12.5px; }
 
 main { display: grid; grid-template-columns: 300px 1fr; gap: 16px; padding: 16px; height: calc(100vh - 54px); }
 #side { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow: auto; }
@@ -124,6 +131,7 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top
     <button id="logout">Keluar</button>
   </header>
   <div id="approvals"></div>
+  <div id="warnings"></div>
   <main>
     <div id="side"></div>
     <section id="detail">
@@ -235,8 +243,17 @@ function refreshSoon() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(async () => { try { const s = await api("/api/state"); state = s; renderAll(); } catch {} }, 400);
 }
+function addWarning(text) {
+  const box = el("div", "warning");
+  const close = el("button", "", "✕");
+  close.onclick = () => box.remove();
+  box.append(el("span", "", "⚠ " + text), close);
+  $("warnings").prepend(box);
+  while ($("warnings").children.length > 5) $("warnings").lastChild.remove();
+}
 function onEvent(ev) {
-  if (ev.kind === "status" && ev.data) {
+  if (ev.kind === "warning") addWarning(ev.text);
+  if ((ev.kind === "status" || ev.kind === "model") && ev.data) {
     const i = state.workers.findIndex((w) => w.id === ev.data.id);
     if (ev.data.status === "home") { if (i >= 0) state.workers.splice(i, 1); if (selected === ev.data.id) selected = null; }
     else if (i >= 0) state.workers[i] = ev.data; else state.workers.push(ev.data);
@@ -256,21 +273,23 @@ function renderStats() {
   const L = state.limits;
   const busy = state.workers.filter((w) => w.status === "working").length;
   $("ram").textContent = `RAM bebas ${state.mem_available_mb} MB` + (state.mem_available_mb < L.min_free_mb ? " (di bawah batas, antre)" : "");
-  $("active").textContent = `${state.workers.length}/${L.max_workers} worker · ${busy} bekerja (maks ${L.max_active})`;
+  $("active").textContent = `${state.workers.length}/${L.max_workers} worker · ${busy} bekerja (maks ${L.max_active})`
+    + (state.paid_tokens ? ` · 💰 ${state.paid_tokens.toLocaleString("id-ID")} token berbayar` : "");
 }
 function renderApprovals() {
   const box = $("approvals"); box.textContent = "";
   for (const a of state.approvals) {
-    const card = el("div", "approval");
+    const card = el("div", "approval" + (a.kind === "paid_model" ? " paid" : ""));
     const row = el("div", "row");
     const t = el("div", "title");
-    t.append(el("b", "", a.worker_name), document.createTextNode(a.kind === "command" ? " ingin menjalankan:" : " ingin mengubah file:"));
+    const what = { command: " ingin menjalankan:", edit: " ingin mengubah file:", paid_model: " 💰 minta model BERBAYAR:" }[a.kind] || ":";
+    t.append(el("b", "", a.worker_name), document.createTextNode(what));
     const code = el("pre", "", a.title); code.style.background = "transparent"; code.style.padding = "2px 0"; code.style.margin = "0";
     t.append(code);
     const yes = el("button", "primary", "Setujui"), no = el("button", "danger", "Tolak");
     yes.onclick = () => decide(a.id, true, card); no.onclick = () => decide(a.id, false, card);
     row.append(t, yes, no); card.append(row);
-    if (a.detail) card.append(diffPre(a.detail));
+    if (a.detail) card.append(a.kind === "edit" ? diffPre(a.detail) : el("pre", "", a.detail));
     box.append(card);
   }
   document.title = state.approvals.length ? `(${state.approvals.length}) Kantor` : "Kantor";
@@ -293,7 +312,8 @@ function renderWorkers() {
       const top = el("div", "top");
       top.append(el("span", "name", w.name), el("span", `badge s-${w.status}`, STATUS[w.status] || w.status));
       c.append(top, el("div", "task", w.task));
-      c.append(el("div", "meta", `${w.model} · ${w.project}${w.branch ? " · " + w.branch : ""}`));
+      c.append(el("div", "meta", `${w.paid ? "💰 " : ""}${w.model} · ${w.project}${w.branch ? " · " + w.branch : ""}`));
+      if (onBackup(w)) c.append(el("div", "meta s-queued", `⚠ sementara pakai cadangan ${w.last_model}`));
       c.onclick = () => select(w.id);
       side.append(c);
       walk(w.name, depth + 1);
@@ -305,6 +325,8 @@ function renderWorkers() {
   renderStats();
 }
 function current() { return state.workers.find((w) => w.id === selected); }
+function onBackup(w) { return w.last_model && state.cheap_models.includes(w.last_model); }
+function tokens(w) { return Object.values(w.usage || {}).reduce((a, b) => a + b, 0); }
 function renderDetailHead() {
   const w = current();
   for (const id of ["head", "log", "send"]) $(id).classList.toggle("hidden", !w);
@@ -313,7 +335,9 @@ function renderDetailHead() {
   $("dName").textContent = w.name;
   $("dStatus").textContent = STATUS[w.status] || w.status;
   $("dStatus").className = `badge s-${w.status}`;
-  $("dMeta").textContent = `${w.model} · ${w.project} · ${w.branch || "checkout utama"}` + (w.parent ? ` · direkrut oleh ${w.parent}` : "");
+  $("dMeta").textContent = `${w.paid ? "💰 " : ""}${w.model}` + (onBackup(w) ? ` (⚠ sementara ${w.last_model})` : "")
+    + ` · ${w.project} · ${w.branch || "checkout utama"}` + (w.parent ? ` · direkrut oleh ${w.parent}` : "")
+    + ` · ${tokens(w).toLocaleString("id-ID")} token`;
 }
 async function select(id) {
   selected = id; logFor = null; renderWorkers(); renderDetailHead();
@@ -358,6 +382,8 @@ function appendEvent(ev, live) {
     case "diff": node = el("div", "ev"); node.append(folded(`diff ${ev.data?.path || ""}`, diffPre(ev.text), live)); break;
     case "approval": if (ev.data?.state !== "pending") node = el("div", "ev system", `${ev.data?.state === "approved" ? "disetujui" : "ditolak"}: ${ev.text}`); break;
     case "error": node = el("div", "ev error", "⚠ " + ev.text); break;
+    case "warning": node = el("div", "ev warning", "⚠ " + ev.text); break;
+    case "notice": case "model": node = el("div", "ev notice", "ℹ " + ev.text); break;
     case "status": node = el("div", "ev status", `— ${STATUS[ev.text] || ev.text} · ${ago(ev.ts)} lalu —`); break;
     default: node = el("div", "ev system", ev.text);
   }
@@ -391,17 +417,27 @@ function fillHire() {
   const p = $("hProject"); p.textContent = "";
   for (const name of state.projects) p.append(Object.assign(el("option", "", name), { value: name }));
   const m = $("hModel"); m.textContent = "";
-  for (const [name, desc] of Object.entries(state.models)) {
-    const o = Object.assign(el("option", "", `${name} — ${desc}`), { value: name });
-    if (name === state.default_model) o.selected = true;
-    m.append(o);
-  }
+  const group = (label, items) => {
+    const g = el("optgroup"); g.label = label;
+    for (const [value, text] of items) g.append(Object.assign(el("option", "", text), { value }));
+    m.append(g);
+  };
+  const T = state.tiers;
+  group("Berdasarkan kesulitan", [["auto", "Otomatis: kesulitan dinilai dari tugasnya"],
+    ["tier:easy", `Mudah → ${T.easy}`], ["tier:normal", `Normal → ${T.normal}`], ["tier:hard", `Sulit → ${T.hard}`]]);
+  group("Model tertentu", Object.entries(state.models).map(([n, d]) => [`model:${n}`, d ? `${n} — ${d}` : n]));
+  const paid = Object.entries(state.paid_models);
+  if (paid.length) group("💰 Berbayar", paid.map(([n, d]) => [`model:${n}`, `💰 ${n}${d ? " — " + d : ""}`]));
 }
 $("newBtn").onclick = () => { fillHire(); $("hireErr").textContent = ""; $("hireDlg").showModal(); $("hTask").focus(); };
 $("hireForm").onsubmit = async (e) => {
   e.preventDefault(); $("hireErr").textContent = "";
   try {
-    const r = await api("/api/workers", { project: $("hProject").value, model: $("hModel").value, name: $("hName").value.trim(), task: $("hTask").value });
+    const choice = $("hModel").value;
+    if (choice.startsWith("model:") && state.paid_models[choice.slice(6)] !== undefined
+        && !confirm(`${choice.slice(6)} adalah model BERBAYAR. Pakai untuk worker ini?`)) return;
+    const pick = choice.startsWith("tier:") ? { difficulty: choice.slice(5) } : choice.startsWith("model:") ? { model: choice.slice(6) } : {};
+    const r = await api("/api/workers", { project: $("hProject").value, name: $("hName").value.trim(), task: $("hTask").value, ...pick });
     $("hireDlg").close(); $("hTask").value = ""; $("hName").value = "";
     state = await api("/api/state"); renderAll(); select(r.id);
   } catch (err) { $("hireErr").textContent = err.message; }

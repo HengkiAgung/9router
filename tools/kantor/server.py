@@ -209,8 +209,8 @@ class Handler(BaseHTTPRequestHandler):
         office = APP.office
         if path == "/api/workers":
             w = office.hire(str(b.get("project", "")), str(b.get("task", "")), name=b.get("name") or None,
-                            model=b.get("model") or None)
-            return {"id": w.id, "name": w.name}
+                            model=b.get("model") or None, difficulty=b.get("difficulty") or None)
+            return {"id": w.id, "name": w.name, "model": w.model, "note": w.model_note}
         if path == "/api/projects":
             return {"name": office.add_project(str(b.get("name", "")), (b.get("git_url") or "").strip() or None)}
         m = re.fullmatch(r"/api/approvals/([0-9a-f]{10})", path)
