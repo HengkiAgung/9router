@@ -43,3 +43,13 @@ docker compose logs -f
 Dashboard: http://localhost:20128 (login with `INITIAL_PASSWORD`). API: http://localhost:20128/v1.
 
 VPS: clone, create `.env`, `docker compose up -d`. Put a reverse proxy (Caddy/nginx) with HTTPS in front, keep `NINEROUTER_BIND=127.0.0.1`, set `BASE_URL` to the public URL, `AUTH_COOKIE_SECURE=true`, `REQUIRE_API_KEY=true`. Update: `docker compose pull && docker compose up -d`.
+
+## Orkestra (multi-model coding agent)
+`tools/orchestrator.py` sends a request to a router model, which splits it into planner / coder / reviewer / writer steps and picks a 9router model for each. The agents read, search and edit files and run commands in the workspace; edits and commands ask for confirmation. Stdlib only.
+```
+cd /path/to/your/project
+python /path/to/tools/orchestrator.py "fix the failing test"   # one request
+python /path/to/tools/orchestrator.py                          # interactive loop
+```
+Flags: `--auto-edit` (apply edits without asking), `--yes` (also run commands without asking), `--root DIR`.
+Config: `NINEROUTER_API_KEY` (and optional `ORCH_BASE_URL`, `ORCH_MODELS`) from the environment, `~/.config/orkestra/.env`, or this repo's `.env`. On another machine, copy the single file and create `~/.config/orkestra/.env`.
