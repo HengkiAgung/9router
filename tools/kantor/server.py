@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from engine import Config, Office, TeamError, clip  # noqa: E402
+import knowledge as kb  # noqa: E402
 
 UI_FILE = Path(__file__).resolve().parent / "ui.html"
 SESSION_DAYS = 7
@@ -238,15 +239,20 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True}
 
     def worker_diff(self, w) -> str:
+        """Status, own commits and uncommitted diff of each repo in the worker's folder."""
+        git = APP.office._git
         cwd = Path(w.cwd)
-        status = APP.office._git(cwd, "status", "--short").stdout
-        out = f"$ git status --short\n{status or '(clean)'}\n"
-        if w.branch:
-            log = APP.office._git(cwd, "log", "--oneline", "-20", "HEAD", "--not", "--exclude=kantor/*",
-                                  "--branches").stdout
-            out += f"\n$ commits on {w.branch} not on other branches\n{log or '(none)'}\n"
-        diff = APP.office._git(cwd, "diff", "HEAD").stdout
-        return clip(out + f"\n$ git diff HEAD\n{diff or '(no uncommitted changes)'}", 200_000)
+        out = []
+        for repo in kb.repos(cwd) or [cwd]:
+            head = f"=== {repo.name if repo != cwd else w.project} ===\n" if repo != cwd or kb.nested(cwd) else ""
+            status = git(repo, "status", "--short").stdout
+            text = f"{head}$ git status --short\n{status or '(clean)'}\n"
+            if w.branch:
+                log = git(repo, "log", "--oneline", "-20", "HEAD", "--not", "--exclude=kantor/*", "--branches").stdout
+                text += f"\n$ commits on {w.branch} not on other branches\n{log or '(none)'}\n"
+            diff = git(repo, "diff", "HEAD").stdout
+            out.append(text + f"\n$ git diff HEAD\n{diff or '(no uncommitted changes)'}\n")
+        return clip("\n".join(out), 200_000)
 
     def stream(self, after: int) -> None:
         self.send_response(200)

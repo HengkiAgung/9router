@@ -135,6 +135,7 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top
       <span id="conn"><span class="dot"></span><span id="connText">menyambung…</span></span>
       <span id="ram"></span>
       <span id="active"></span>
+      <span id="graphNote" title="Status code graph per project"></span>
     </div>
     <label class="switch" title="Auto: perintah dan edit dijalankan tanpa persetujuan, kecuali perintah berisiko dan model berbayar">
       <input type="checkbox" id="autoSw"><span>Auto</span><span id="autoNote" class="hidden">tanpa persetujuan</span>
@@ -187,8 +188,8 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top
     <h2>Project baru</h2>
     <label>Nama folder</label>
     <input id="pName" required pattern="[A-Za-z0-9._\-]{1,64}">
-    <label>Git URL (opsional; kosongkan untuk project kosong)</label>
-    <input id="pUrl" placeholder="https://github.com/user/repo.git atau git@github.com:user/repo.git">
+    <label>Git URL (opsional). Satu URL = satu repo; beberapa URL (satu per baris) = project multi-repo; kosong = project baru</label>
+    <textarea id="pUrl" rows="3" placeholder="git@github.com:user/backend.git&#10;git@github.com:user/frontend.git"></textarea>
     <div class="err" id="projErr"></div>
     <div class="actions"><button type="button" data-close>Batal</button><button class="primary">Buat</button></div>
   </form>
@@ -265,6 +266,11 @@ function addWarning(text) {
 }
 function onEvent(ev) {
   if (ev.kind === "warning") addWarning(ev.text);
+  if (ev.kind === "graph" && ev.data) {
+    state.graph_status[ev.data.project] = ev.data.state === "running" ? "updating" : ev.text;
+    renderGraph();
+    if (ev.data.state === "failed") addWarning(ev.text);
+  }
   if ((ev.kind === "status" || ev.kind === "model") && ev.data) {
     const i = state.workers.findIndex((w) => w.id === ev.data.id);
     if (ev.data.status === "home") { if (i >= 0) state.workers.splice(i, 1); if (selected === ev.data.id) selected = null; }
@@ -281,7 +287,13 @@ setInterval(async () => {
 }, 15000);
 
 // --- rendering -----------------------------------------------------------------------------------
-function renderAll() { renderStats(); renderAuto(); renderApprovals(); renderWorkers(); renderDetailHead(); }
+function renderAll() { renderStats(); renderAuto(); renderGraph(); renderApprovals(); renderWorkers(); renderDetailHead(); }
+function renderGraph() {
+  const s = state.graph_status || {};
+  const busy = Object.keys(s).filter((p) => s[p] === "updating");
+  $("graphNote").textContent = busy.length ? `🕸 graph: memperbarui ${busy.join(", ")}…` : "";
+  $("graphNote").title = Object.entries(s).map(([p, t]) => `${p}: ${t}`).join("\n") || "Status code graph per project";
+}
 function renderAuto() {
   $("autoSw").checked = !!state.auto_mode;
   document.querySelector("header").classList.toggle("auto-on", !!state.auto_mode);

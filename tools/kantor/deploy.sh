@@ -35,11 +35,22 @@ sudo -u kantor test -f /home/kantor/.ssh/id_ed25519 ||
   sudo -u kantor ssh-keygen -q -t ed25519 -N '' -C "kantor@$(hostname)" -f /home/kantor/.ssh/id_ed25519
 sudo -u kantor sh -c 'ssh-keygen -F github.com >/dev/null 2>&1 || ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null'
 
+GRAPHIFY_VERSION=$(get KANTOR_GRAPHIFY_VERSION); GRAPHIFY_VERSION=${GRAPHIFY_VERSION:-0.9.79}
+if [ "$(get KANTOR_GRAPH)" != "false" ]; then
+  echo "== graphify $GRAPHIFY_VERSION for kantor"
+  sudo -u kantor sh -c "
+    V=\$HOME/.local/share/graphify-venv
+    [ -x \$V/bin/python3 ] || python3 -m venv \$V
+    \$V/bin/pip show graphifyy 2>/dev/null | grep -qx 'Version: $GRAPHIFY_VERSION' ||
+      \$V/bin/pip install -q 'graphifyy==$GRAPHIFY_VERSION'
+    mkdir -p \$HOME/.local/bin && ln -sf \$V/bin/graphify \$HOME/.local/bin/graphify"
+fi
+
 echo "== code -> /opt/kantor"
 sudo install -d -m 755 /opt/kantor/tools/kantor
 sudo install -m 644 "$REPO/tools/orchestrator.py" /opt/kantor/tools/
-sudo install -m 644 "$REPO/tools/kantor/engine.py" "$REPO/tools/kantor/server.py" "$REPO/tools/kantor/ui.html" \
-  /opt/kantor/tools/kantor/
+sudo install -m 644 "$REPO/tools/kantor/engine.py" "$REPO/tools/kantor/knowledge.py" "$REPO/tools/kantor/server.py" \
+  "$REPO/tools/kantor/ui.html" /opt/kantor/tools/kantor/
 
 echo "== config -> /etc/kantor/kantor.env"
 HASH=$(get KANTOR_PASSWORD | python3 -I /opt/kantor/tools/kantor/server.py hash-password)
@@ -56,7 +67,7 @@ trap 'rm -f "$TMP"' EXIT
   python3 -I - "$ENV_FILE" <<'PY'
 import re, sys
 skip = {"KANTOR_PASSWORD", "KANTOR_DOMAIN", "KANTOR_PORT", "KANTOR_BASE_URL", "KANTOR_DATA_DIR",
-        "KANTOR_PROJECTS_DIR", "KANTOR_MEMORY_MAX_MB", "KANTOR_MEMORY_HIGH_MB"}
+        "KANTOR_PROJECTS_DIR", "KANTOR_MEMORY_MAX_MB", "KANTOR_MEMORY_HIGH_MB", "KANTOR_GRAPHIFY_VERSION"}
 for line in open(sys.argv[1], encoding="utf-8"):
     m = re.match(r"(KANTOR_[A-Z_]+)=(.*)$", line.rstrip("\n"))
     if m and m.group(1) not in skip:

@@ -28,7 +28,9 @@ from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from orchestrator import LLM, MAX_TOOL_RESULT, TOOL_SPECS, Workspace, tool_spec  # noqa: E402
+import knowledge as kb  # noqa: E402
 
 # What each model is good for, shown to agents and in the UI (KANTOR_MODEL_NOTES replaces it).
 # Checked against this 9router on 2026-11-03: all answer with tool calls.
@@ -62,6 +64,7 @@ BUSY = {"working", "queued", "waiting_memory", "waiting_approval", "waiting_comm
 # outside the worker's folder.
 SAFE_COMMANDS = {"ls", "pwd", "cat", "head", "tail", "wc", "grep", "rg", "tree", "stat", "file", "du", "diff", "find"}
 SAFE_GIT = {"status", "diff", "log", "show", "rev-parse", "ls-files", "blame"}
+SAFE_GRAPHIFY = {"query", "explain", "path", "affected", "god-nodes"}  # read graph.json only
 UNSAFE_ARGS = {"-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint", "-fprintf", "-fls", "--ext-diff"}
 # Commands that can take hundreds of MB; they run one at a time (KANTOR_MAX_HEAVY_COMMANDS).
 HEAVY_RX = re.compile(r"\b(npm|npx|pnpm|yarn|bun|node|next|vite|tsc|webpack|pip3?|poetry|uv|docker|"
@@ -71,7 +74,7 @@ HEAVY_RX = re.compile(r"\b(npm|npx|pnpm|yarn|bun|node|next|vite|tsc|webpack|pip3
 RISKY_COMMANDS = [
     (r"/var/lib/kantor|kantor\.db|/proc/[^\s]*/environ", "touches Kantor's own state or secrets"),
     (r"\bgit\s+push\b", "pushes to another machine"),
-    (r"\b(ssh|scp|sftp)\b|\brsync\b[^\n]*:", "reaches another machine"),
+    (r"(?<![\w./-])(ssh|scp|sftp)\b|\brsync\b[^\n]*:", "reaches another machine"),  # not ~/.ssh/ paths
     (r"\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(sh|bash|zsh|python3?)\b", "runs a downloaded script"),
     (r"\brm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+(-[a-zA-Z]+\s+)*(/|~|\$HOME|\*|\.\.?/?)(\s|$)", "deletes a whole tree"),
     (r"\b(sudo|su|systemctl|crontab|shutdown|reboot|mkfs|pkill|killall)\b|\bdd\s+if=|\bkill\s+-9\s+-1\b",
@@ -111,9 +114,13 @@ def is_safe_command(command: str) -> bool:
         parts = shlex.split(command)
     except ValueError:
         return False
-    if not parts or parts[0] not in SAFE_COMMANDS | {"git"}:
+    if not parts:
         return False
     args = parts[1:]
+    if parts[0] == "graphify":  # graph paths are absolute, which is fine for a read-only query
+        return bool(args) and args[0] in SAFE_GRAPHIFY and "--output" not in command
+    if parts[0] not in SAFE_COMMANDS | {"git"}:
+        return False
     if any(a.startswith(("/", "~")) or ".." in a or a in UNSAFE_ARGS or a.startswith("--output") for a in args):
         return False
     return parts[0] != "git" or (bool(args) and args[0] in SAFE_GIT)
@@ -159,6 +166,11 @@ class Config:
             "hard": env.get("KANTOR_MODEL_HARD") or "ag/claude-opus-4-6-thinking",
         }
         self.default_model = self.tiers["normal"]
+        # Project memory: KANTOR.md notes and graphify code graphs (see knowledge.py).
+        self.graph = flag("KANTOR_GRAPH", True)
+        self.graph_label_model = env.get("KANTOR_GRAPH_LABEL_MODEL", "ag/gemini-3.8-flash") or None
+        self.graph_split_files = num("KANTOR_GRAPH_SPLIT_FILES", 1500)
+        self.auto_notes = flag("KANTOR_AUTO_NOTES", True)
         self.classifier_model = env.get("KANTOR_CLASSIFIER_MODEL") or self.tiers["easy"]
         # Tried in order when a worker's own model fails.
         self.fallback_models = models("KANTOR_FALLBACK_MODELS", "ag/claude-sonnet-4-6,ollama/gpt-oss:120b")
@@ -308,7 +320,9 @@ class KantorWorkspace(Workspace):
         env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "TZ") if k in os.environ}
         env.update(HOME=user.pw_dir, USER=user.pw_name, TERM="dumb", CI="1", GIT_TERMINAL_PROMPT="0",
                    KANTOR_WORKER=self.worker.name)
-        env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+        env["PATH"] = f"{user.pw_dir}/.local/bin:" + env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+        # If the RAM cap is hit, the kernel kills the agent's command, not Kantor itself.
+        command = f"echo 500 > /proc/self/oom_score_adj 2>/dev/null; {command}"
         proc = subprocess.Popen(command, shell=True, cwd=self.root, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 errors="replace", start_new_session=True)
@@ -337,6 +351,9 @@ TEAM_SPECS = {
          "model": {"type": "string", "description": "A specific model instead of the difficulty's."},
          "justification": {"type": "string", "description": "Required for a paid model: why the free "
                            "tiers are not enough for this task."},
+         "repos": {"type": "array", "items": {"type": "string"},
+                   "description": "Multi-repo project only: the repos it needs (each is a full copy of "
+                   "the code). Default: all."},
          "name": {"type": "string", "description": "Optional name."}},
         ["task"]),
     "switch_model": tool_spec(
@@ -379,6 +396,7 @@ class Worker:
         self.usage: dict[str, int] = row.get("usage") or {}  # tokens per model
         self.last_model: str | None = row.get("last_model")
         self.model_note = ""  # how its model was picked, for the hirer
+        self.ephemeral = False  # goes home by itself after its task (the note taker)
         self.inbox: deque[tuple[str, str]] = deque()
         self.cond = threading.Condition()
         self.cancel = threading.Event()
@@ -484,6 +502,11 @@ class Worker:
             self.office.events.emit(self.id, "report", self.report)
             self.save()
             self.set_status(status)
+            if self.parent is None:  # it works in the main checkout, so the code graph may be stale now
+                if self.ephemeral:
+                    self.office.send_home(self)
+                    return
+                self.office.schedule_graph(self.project)
 
     def _system_prompt(self) -> str:
         cfg = self.office.cfg
@@ -519,7 +542,40 @@ class Worker:
             "Finish every task with a short report: what you did, what is left, and where the changes are.",
             "Reply in the language the user writes in.",
         ]
-        return "\n".join(lines)
+        return "\n".join(lines + self._project_context())
+
+    def _project_context(self) -> list[str]:
+        """Multi-repo layout, the project's KANTOR.md notes and its code graph summary."""
+        cfg = self.office.cfg
+        project_dir = cfg.projects_dir / self.project
+        out = []
+        inner = kb.nested(Path(self.cwd))
+        if inner:
+            out += ["", f"This is a multi-repo project: {', '.join(inner)} are separate git repos inside your "
+                    "folder. Run git per repo (git -C <repo> status)."
+                    + (f" Each has your branch {self.branch}; commit in every repo you changed." if self.branch else
+                       " To merge a worker's work, merge its branch in each repo it changed "
+                       "(git -C <repo> merge kantor/<name>). When hiring, pass repos to give a worker only the "
+                       "repos it needs: each one is a full copy of that code.")]
+        notes = kb.notes_for_prompt(project_dir, limit=3000)
+        if notes:
+            out += ["", "Project notes (KANTOR.md). Follow them. "
+                    + ("You work in the main checkout, so keep them current: when you learn something durable "
+                       "(architecture, how to run or test, a convention, a pitfall), edit the KANTOR.md it "
+                       "belongs to, and put in what your workers report learning. Replace '(belum diisi)'."
+                       if self.parent is None else
+                       "You can't edit them from your worktree: put anything durable you learn about the "
+                       "project in your report, so your hirer can add it."),
+                    notes]
+        if cfg.graph:
+            graph = kb.graph_for_prompt(project_dir, limit=1200)
+            if graph:
+                out += ["", "Code graph of the main checkout (it can lag behind uncommitted work). Use it "
+                        "before searching file by file: graphify query \"<question>\" --graph <graph.json>, "
+                        "graphify explain \"<name>\" --graph <graph.json>, graphify affected \"<name>\" --graph "
+                        "<graph.json> (what depends on it). These only read and run without approval.",
+                        graph]
+        return out
 
     def _tools(self) -> list[dict]:
         return [TOOL_SPECS[t] for t in WORK_TOOLS] + list(TEAM_SPECS.values())
@@ -633,7 +689,108 @@ class Office:
         self._auto_mode = saved[0][0] == "1" if saved else cfg.auto_approve
         self.workers: dict[str, Worker] = {}
         cfg.projects_dir.mkdir(parents=True, exist_ok=True)
+        # Code graphs are built one project at a time in the background (see knowledge.py).
+        self.graph_cond = threading.Condition()
+        self.graph_pending: list[str] = []
+        self.graph_status: dict[str, str] = {}
         self._load()
+        threading.Thread(target=self._graph_loop, name="graphs", daemon=True).start()
+        for project in self.projects():  # set up what already exists: notes, then graphs
+            self.setup_project(project)
+
+    # --- project memory: KANTOR.md and code graphs ----------------------------------------------
+
+    def setup_project(self, project: str) -> None:
+        try:
+            made = kb.ensure_notes(self.cfg.projects_dir / project)
+        except OSError as e:
+            self.events.emit(None, "error", f"{project}: could not write KANTOR.md: {e}")
+            return
+        if made:
+            self.events.emit(None, "graph", f"{project}: created {', '.join(str(m.relative_to(self.cfg.projects_dir)) for m in made)}",
+                             {"project": project, "state": "notes"})
+        self.schedule_graph(project)
+
+    def schedule_graph(self, project: str) -> None:
+        if not self.cfg.graph:
+            return
+        with self.graph_cond:
+            if project not in self.graph_pending:
+                self.graph_pending.append(project)
+                self.graph_cond.notify()
+
+    def _graph_loop(self) -> None:
+        while True:
+            with self.graph_cond:
+                while not self.graph_pending:
+                    self.graph_cond.wait()
+                project = self.graph_pending.pop(0)
+            try:
+                self._build_graphs(project)
+            except Exception as e:
+                self.graph_status[project] = f"failed: {clip(str(e), 200)}"
+                self.events.emit(None, "graph", f"{project}: graph update failed: {clip(str(e), 300)}",
+                                 {"project": project, "state": "failed"})
+
+    def _build_graphs(self, project: str) -> None:
+        project_dir = self.cfg.projects_dir / project
+        if not project_dir.is_dir():
+            return
+        self.graph_status[project] = "updating"
+        self.events.emit(None, "graph", f"{project}: updating the code graph", {"project": project, "state": "running"})
+        results = [kb.build(repo, self._graph_run, self.cfg.graph_label_model, self.cfg.graph_split_files)
+                   for repo in kb.repos(project_dir)]
+        summary = "; ".join(results) or "no git repos"
+        self.graph_status[project] = summary
+        self.events.emit(None, "graph", f"{project}: {summary}", {"project": project, "state": "done"})
+        has_code = any(len(kb.code_files(r)) >= kb.MIN_CODE_FILES for r in kb.repos(project_dir))
+        if self.cfg.auto_notes and has_code and kb.notes_unfilled(project_dir):
+            self._hire_note_taker(project)
+
+    def _graph_run(self, args: list[str], cwd: Path) -> tuple[int, str]:
+        """Run graphify as a heavy command: one at a time, after the free-RAM gate, first to be killed."""
+        with self.heavy_gate:
+            while mem_available_mb() < self.cfg.min_free_mb:
+                time.sleep(5)
+            env = {k: os.environ[k] for k in ("LANG", "LC_ALL", "TZ") if k in os.environ}
+            home = pwd.getpwuid(os.getuid()).pw_dir
+            env.update(HOME=home, PATH=f"{home}/.local/bin:/usr/local/bin:/usr/bin:/bin", GIT_TERMINAL_PROMPT="0")
+            if self.cfg.graph_label_model:  # community names, through 9router
+                env.update(OPENAI_BASE_URL=self.cfg.base_url, OPENAI_API_KEY=self.cfg.api_key,
+                           OPENAI_MODEL=self.cfg.graph_label_model)
+            cmd = ["sh", "-c", 'echo 900 > /proc/self/oom_score_adj 2>/dev/null; exec "$@"', "sh", str(kb.GRAPHIFY), *args]
+            try:
+                p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, errors="replace",
+                                   timeout=1800, stdin=subprocess.DEVNULL)
+                return p.returncode, p.stdout + p.stderr
+            except subprocess.TimeoutExpired:
+                return 124, "timed out after 30 minutes"
+
+    def _hire_note_taker(self, project: str) -> None:
+        """Once per project: a worker that fills in the KANTOR.md templates from the code and the graph."""
+        key = f"notes_bootstrapped:{project}"
+        if self.db.q("select 1 from settings where key = ?", (key,)):
+            return
+        self.db.q("insert or replace into settings(key, value) values (?, '1')", (key,))
+        inner = kb.nested(self.cfg.projects_dir / project)
+        where = "KANTOR.md di folder project" + (f" dan di tiap repo ({', '.join(f'{r}/KANTOR.md' for r in inner)})"
+                                                  if inner else "")
+        task = (f"Tugasmu hanya menulis catatan project: isi {where}. Pakai ringkasan code graph dan catatan di "
+                "prompt-mu, lalu baca README, file konfigurasi (composer.json, package.json, pubspec.yaml, "
+                "requirements.txt, dll.), struktur folder, dan beberapa file inti. Untuk setiap file, isi: "
+                "ringkasan, arsitektur (modul utama" + (" dan hubungan antar repo" if inner else "") + "), cara "
+                "menjalankan dan test, konvensi, serta jebakan. Ganti semua '(belum diisi)'; tulis 'belum "
+                "diketahui' kalau tidak bisa dipastikan dari kode. Maksimal sekitar 80 baris per file. Jangan "
+                "ubah file lain, jangan jalankan perintah yang mengubah apa pun, jangan commit, dan jangan "
+                "merekrut worker.")
+        name = "Pencatat" if "pencatat" not in {w.name.lower() for w in self.present()} else None
+        try:
+            w = self.hire(project, task, name=name, difficulty="normal")
+        except TeamError as e:
+            self.events.emit(None, "graph", f"{project}: could not start the note taker: {e}",
+                             {"project": project, "state": "failed"})
+            return
+        w.ephemeral = True
 
     def _load(self) -> None:
         cols = ["id", "name", "project", "cwd", "branch", "parent", "depth", "model", "status", "task",
@@ -682,6 +839,7 @@ class Office:
             "limits": {"max_workers": self.cfg.max_workers, "max_active": self.cfg.max_active,
                        "max_commands": self.cfg.max_commands, "max_heavy": self.cfg.max_heavy,
                        "max_depth": self.cfg.max_depth, "min_free_mb": self.cfg.min_free_mb},
+            "graph_status": self.graph_status,
             "auto_mode": self._auto_mode,
             "auto_mode_paid": self.cfg.auto_mode_paid,
             "mem_available_mb": mem_available_mb(),
@@ -864,29 +1022,71 @@ class Office:
         return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout,
                               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
-    def _make_worktree(self, project_dir: Path, base_cwd: Path, name: str) -> tuple[str, str] | None:
-        """A worktree of the project on a new branch, cut from the hirer's commit; None outside git."""
-        if self._git(base_cwd, "rev-parse", "--verify", "HEAD").returncode != 0:
+    @staticmethod
+    def _exclude(repo: Path, *entries: str) -> None:
+        exclude = repo / ".git" / "info" / "exclude"
+        if exclude.parent.is_dir():
+            have = (exclude.read_text() if exclude.exists() else "").split()
+            missing = [e for e in entries if e not in have]
+            if missing:
+                with exclude.open("a") as f:
+                    f.write("\n" + "\n".join(missing) + "\n")
+
+    def _make_worktree(self, project_dir: Path, base_cwd: Path, name: str,
+                       only: list[str] | None = None) -> tuple[str, str] | None:
+        """A workspace for a hired worker: a worktree of each of the project's repos on one new branch,
+        cut from the hirer's commits, laid out like the project (nested repos inside). None outside git."""
+        inner = kb.nested(project_dir)
+        if only:
+            unknown = [r for r in only if r not in inner]
+            if unknown:
+                raise TeamError(f"repos are some of: {', '.join(inner)} (unknown: {', '.join(unknown)})")
+            inner = [r for r in inner if r in only]
+        # (repo, the hirer's copy of it, path inside the workspace)
+        pairs = ([(project_dir, base_cwd, "")] if (project_dir / ".git").exists() else []) + \
+                [(project_dir / r, base_cwd / r, r) for r in inner]
+        pairs = [p for p in pairs if self._git(p[1], "rev-parse", "--verify", "HEAD").returncode == 0]
+        if not pairs:
             return None
-        exclude = project_dir / ".git" / "info" / "exclude"
-        if exclude.parent.is_dir() and ".kantor/" not in (exclude.read_text() if exclude.exists() else ""):
-            with exclude.open("a") as f:
-                f.write("\n.kantor/\n")
-        branch = f"kantor/{name.lower()}"
-        n = 1
-        while self._git(project_dir, "rev-parse", "--verify", f"refs/heads/{branch}").returncode == 0:
+        branch, n = f"kantor/{name.lower()}", 1
+        while any(self._git(repo, "rev-parse", "--verify", f"refs/heads/{branch}").returncode == 0
+                  for repo, _, _ in pairs):
             n += 1
             branch = f"kantor/{name.lower()}-{n}"
-        path = project_dir / ".kantor" / "worktrees" / branch.split("/", 1)[1]
-        base = self._git(base_cwd, "rev-parse", "HEAD").stdout.strip()
-        res = self._git(project_dir, "worktree", "add", "-b", branch, str(path), base)
-        if res.returncode != 0:
-            raise TeamError(f"could not create a worktree: {clip(res.stderr, 300)}")
-        return str(path), branch
+        workspace = project_dir / ".kantor" / "worktrees" / branch.split("/", 1)[1]
+        if (project_dir / ".git").exists():
+            self._exclude(project_dir, ".kantor/", *(f"{r}/" for r in kb.nested(project_dir)))
+        else:
+            workspace.mkdir(parents=True, exist_ok=True)
+        for repo, base_repo, rel in pairs:
+            base = self._git(base_repo, "rev-parse", "HEAD").stdout.strip()
+            res = self._git(repo, "worktree", "add", "-b", branch, str(workspace / rel if rel else workspace), base)
+            if res.returncode != 0:
+                raise TeamError(f"could not create a worktree of {rel or project_dir.name}: {clip(res.stderr, 300)}")
+        return str(workspace), branch
+
+    def _remove_workspace(self, w: Worker) -> str:
+        """Remove a worker's worktrees (nested repos first); keep everything if any has uncommitted work."""
+        project_dir = self.cfg.projects_dir / w.project
+        ws = Path(w.cwd)
+        trees = [(project_dir / r, ws / r) for r in kb.nested(project_dir) if (ws / r / ".git").exists()]
+        if (project_dir / ".git").exists() and (ws / ".git").is_file():
+            trees.append((project_dir, ws))
+        dirty = [str(t.relative_to(ws)) if t != ws else "." for _, t in trees
+                 if self._git(t, "status", "--porcelain").stdout.strip()]
+        if dirty:
+            return f" (worktree kept: uncommitted changes in {', '.join(dirty)})"
+        for repo, tree in trees:
+            res = self._git(repo, "worktree", "remove", str(tree))
+            if res.returncode != 0:
+                return f" (worktree partly kept: {clip(res.stderr, 200)})"
+        if ws.is_dir() and not any(ws.iterdir()):
+            ws.rmdir()
+        return " (worktree removed, branch kept)"
 
     def hire(self, project: str, task: str, parent: Worker | None = None, name: str | None = None,
              model: str | None = None, difficulty: str | None = None,
-             justification: str | None = None) -> Worker:
+             justification: str | None = None, repos: list[str] | None = None) -> Worker:
         task = (task or "").strip()
         if not task:
             raise TeamError("give the worker its task")
@@ -916,7 +1116,7 @@ class Office:
             project_dir = self._project_dir(parent.project if parent else project)
             cwd, branch = str(project_dir), None
             if parent:  # agent-hired workers get their own worktree
-                tree = self._make_worktree(project_dir, Path(parent.cwd), name)
+                tree = self._make_worktree(project_dir, Path(parent.cwd), name, repos)
                 if tree:
                     cwd, branch = tree
             w = Worker(self, {"id": uuid.uuid4().hex[:10], "name": name, "project": project_dir.name,
@@ -937,16 +1137,7 @@ class Office:
         w.stop()
         with w.cond:
             w.cond.notify()
-        note = ""
-        if delete_worktree and w.branch:
-            project_dir = self.cfg.projects_dir / w.project
-            dirty = self._git(Path(w.cwd), "status", "--porcelain").stdout.strip()
-            if dirty:
-                note = " (worktree kept: it has uncommitted changes)"
-            else:
-                res = self._git(project_dir, "worktree", "remove", w.cwd)
-                note = " (worktree removed, branch kept)" if res.returncode == 0 else \
-                    f" (worktree kept: {clip(res.stderr, 200)})"
+        note = self._remove_workspace(w) if delete_worktree and w.branch else ""
         w.status = "home"
         w.save()
         self.events.emit(w.id, "status", "home", w.row())
@@ -955,17 +1146,31 @@ class Office:
         return f"{w.name} went home{note}"
 
     def add_project(self, name: str, git_url: str | None) -> str:
+        """An empty git project, one cloned repo, or (several URLs, one per line) a multi-repo project
+        with each repo cloned into a folder named after it."""
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name or "") or name.startswith("."):
             raise TeamError("name: letters, digits, dot, dash or underscore")
         path = self.cfg.projects_dir / name
         if path.exists():
             raise TeamError(f"{name} already exists")
-        if git_url:
-            if not re.fullmatch(r"(https://|git@)[\w.@:/~+-]+", git_url):
-                raise TeamError("git_url is an https:// or git@ address")
-            res = self._git(self.cfg.projects_dir, "clone", "--", git_url, name, timeout=600)
+        urls = [u.strip() for u in (git_url or "").splitlines() if u.strip()]
+        for u in urls:
+            if not re.fullmatch(r"(https://|git@)[\w.@:/~+-]+", u):
+                raise TeamError(f"not an https:// or git@ address: {u}")
+        if len(urls) == 1:
+            res = self._git(self.cfg.projects_dir, "clone", "--", urls[0], name, timeout=600)
             if res.returncode != 0:
                 raise TeamError(f"clone failed: {clip(res.stderr, 500)}")
+        elif urls:
+            folders = [re.sub(r"\.git$", "", u.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]) for u in urls]
+            if len(set(folders)) != len(folders):
+                raise TeamError("two URLs end in the same repo name")
+            path.mkdir()
+            for u, folder in zip(urls, folders):
+                res = self._git(path, "clone", "--", u, folder, timeout=900)
+                if res.returncode != 0:
+                    raise TeamError(f"clone of {u} failed: {clip(res.stderr, 500)} "
+                                    f"(the repos cloned so far are in {name})")
         else:
             path.mkdir()
             self._git(path, "init", "-q")
@@ -973,6 +1178,7 @@ class Office:
             self._git(path, "add", "README.md")
             self._git(path, "commit", "-qm", "Start project")
         self.events.emit(None, "project", name)
+        self.setup_project(name)  # KANTOR.md templates, then the code graph and the note taker
         return name
 
     # --- team tools (called by workers) ---------------------------------------------------------
@@ -987,9 +1193,12 @@ class Office:
         return "\n".join(rows)
 
     def tool_hire_worker(self, me: Worker, task: str, difficulty: str | None = None, model: str | None = None,
-                         justification: str | None = None, name: str | None = None) -> str:
+                         justification: str | None = None, name: str | None = None,
+                         repos: list | None = None) -> str:
+        if repos is not None and not (isinstance(repos, list) and all(isinstance(r, str) for r in repos)):
+            raise TeamError("repos is a list of repo folder names")
         w = self.hire(me.project, task, parent=me, name=name, model=model, difficulty=difficulty,
-                      justification=justification)
+                      justification=justification, repos=repos or None)
         return (f"Hired {w.name} on {w.model} ({w.model_note}), branch {w.branch or 'shared checkout'}. "
                 "It is working now; call wait_for_workers to get its report.")
 
