@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kantor</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --line: #e2e5ea; --text: #1d232b; --muted: #677282;
+  --accent: #2f6fdf; --ok: #1f9d55; --warn: #c27c0e; --bad: #d64545; --code: #f0f2f5;
+  --add: #e6f6ec; --del: #fdecec;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111418; --panel: #181c22; --line: #2a3038; --text: #e4e8ee; --muted: #8b95a3;
+    --accent: #6b9cf0; --ok: #3ccf7f; --warn: #e6a640; --bad: #ef6b6b; --code: #20252c;
+    --add: #15301f; --del: #3a1b1b; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--bad); }
+input, select, textarea { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; width: 100%; }
+textarea { resize: vertical; min-height: 70px; }
+pre, code { font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+
+header { display: flex; align-items: center; gap: 14px; padding: 10px 16px; background: var(--panel);
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; }
+header .stats { display: flex; gap: 14px; color: var(--muted); font-size: 13px; flex: 1; flex-wrap: wrap; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+.live .dot { background: var(--ok); }
+
+#approvals { padding: 0 16px; }
+.approval { background: var(--panel); border: 1px solid var(--warn); border-left: 4px solid var(--warn);
+  border-radius: 8px; padding: 10px 12px; margin-top: 12px; }
+.approval .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.approval .title { flex: 1; min-width: 200px; }
+.approval pre { background: var(--code); padding: 8px; border-radius: 6px; margin-top: 8px; max-height: 300px; overflow: auto; }
+
+main { display: grid; grid-template-columns: 300px 1fr; gap: 16px; padding: 16px; height: calc(100vh - 54px); }
+#side { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow: auto; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; cursor: pointer; }
+.card.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.card .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.card .name { font-weight: 600; }
+.card .task { color: var(--muted); font-size: 13px; margin-top: 4px; display: -webkit-box;
+  -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.card .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.badge { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: var(--code); white-space: nowrap; }
+.s-working, .s-waiting_team { color: var(--accent); }
+.s-waiting_approval { color: var(--warn); font-weight: 600; }
+.s-queued, .s-waiting_memory, .s-waiting_command { color: var(--warn); }
+.s-idle { color: var(--ok); }
+.s-error { color: var(--bad); }
+
+#detail { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; display: flex;
+  flex-direction: column; min-height: 0; }
+#detail .head { padding: 12px 14px; border-bottom: 1px solid var(--line); display: flex; gap: 10px;
+  align-items: center; flex-wrap: wrap; }
+#detail .head .info { flex: 1; min-width: 200px; }
+#log { flex: 1; overflow: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+#send { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); }
+#send textarea { min-height: 42px; height: 42px; }
+.ev { font-size: 13.5px; }
+.ev.user { align-self: flex-end; max-width: 85%; background: var(--accent); color: #fff; padding: 8px 11px; border-radius: 10px 10px 2px 10px; }
+.ev.user.from-worker { background: var(--code); color: var(--text); }
+.ev.user .from { font-size: 11.5px; opacity: .8; }
+.ev.assistant, .ev.report { white-space: pre-wrap; }
+.ev.report { border-left: 3px solid var(--ok); padding-left: 10px; }
+.ev.tool { color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
+.ev.status, .ev.system { color: var(--muted); font-size: 12px; text-align: center; }
+.ev.error { color: var(--bad); }
+.ev details { background: var(--code); border-radius: 6px; padding: 4px 8px; }
+.ev details pre { max-height: 360px; overflow: auto; padding: 4px 0; }
+.ev summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+.ln-add { background: var(--add); display: block; }
+.ln-del { background: var(--del); display: block; }
+.empty { color: var(--muted); padding: 40px 20px; text-align: center; }
+
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--text);
+  width: min(560px, calc(100vw - 32px)); padding: 18px; }
+dialog::backdrop { background: rgb(0 0 0 / .45); }
+dialog h2 { margin: 0 0 12px; font-size: 16px; }
+dialog label { display: block; margin: 10px 0 4px; font-size: 13px; color: var(--muted); }
+dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.err { color: var(--bad); font-size: 13px; margin-top: 8px; min-height: 1em; }
+
+#login { max-width: 340px; margin: 18vh auto; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 24px; }
+#login h1 { margin: 0 0 14px; font-size: 18px; }
+
+@media (max-width: 760px) {
+  main { grid-template-columns: 1fr; height: auto; }
+  #side { max-height: 40vh; }
+  #detail { min-height: 70vh; }
+}
+</style>
+</head>
+<body>
+
+<form id="login" class="hidden">
+  <h1>Kantor</h1>
+  <input id="pw" type="password" placeholder="Password" autocomplete="current-password" required>
+  <div class="err" id="loginErr"></div>
+  <button class="primary" style="width:100%;margin-top:8px">Masuk</button>
+</form>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>Kantor</h1>
+    <div class="stats">
+      <span id="conn"><span class="dot"></span><span id="connText">menyambung…</span></span>
+      <span id="ram"></span>
+      <span id="active"></span>
+    </div>
+    <button class="primary" id="newBtn">+ Worker</button>
+    <button id="logout">Keluar</button>
+  </header>
+  <div id="approvals"></div>
+  <main>
+    <div id="side"></div>
+    <section id="detail">
+      <div class="empty" id="noSel">Pilih worker, atau rekrut yang baru dengan <b>+ Worker</b>.</div>
+      <div class="head hidden" id="head">
+        <div class="info">
+          <div><b id="dName"></b> <span class="badge" id="dStatus"></span></div>
+          <div class="muted" style="font-size:12.5px" id="dMeta"></div>
+        </div>
+        <button id="diffBtn">Perubahan</button>
+        <button id="stopBtn">Hentikan</button>
+        <button class="danger" id="homeBtn">Pulangkan</button>
+      </div>
+      <div id="log" class="hidden"></div>
+      <form id="send" class="hidden">
+        <textarea id="msg" placeholder="Pesan atau tugas untuk worker ini… (Ctrl+Enter untuk kirim)"></textarea>
+        <button class="primary">Kirim</button>
+      </form>
+    </section>
+  </main>
+</div>
+
+<dialog id="hireDlg">
+  <form id="hireForm">
+    <h2>Rekrut worker</h2>
+    <label>Project</label>
+    <div style="display:flex;gap:8px"><select id="hProject"></select><button type="button" id="addProjBtn" style="white-space:nowrap">+ Project</button></div>
+    <label>Model</label>
+    <select id="hModel"></select>
+    <label>Nama (opsional)</label>
+    <input id="hName" maxlength="24">
+    <label>Tugas</label>
+    <textarea id="hTask" rows="6" required placeholder="Misal: Bagi pekerjaan ini ke beberapa worker: …"></textarea>
+    <div class="err" id="hireErr"></div>
+    <div class="actions"><button type="button" data-close>Batal</button><button class="primary">Rekrut</button></div>
+  </form>
+</dialog>
+
+<dialog id="projDlg">
+  <form id="projForm">
+    <h2>Project baru</h2>
+    <label>Nama folder</label>
+    <input id="pName" required pattern="[A-Za-z0-9._\-]{1,64}">
+    <label>Git URL (opsional; kosongkan untuk project kosong)</label>
+    <input id="pUrl" placeholder="https://github.com/user/repo.git atau git@github.com:user/repo.git">
+    <div class="err" id="projErr"></div>
+    <div class="actions"><button type="button" data-close>Batal</button><button class="primary">Buat</button></div>
+  </form>
+</dialog>
+
+<dialog id="diffDlg" style="width:min(1000px,calc(100vw - 32px))">
+  <h2>Perubahan</h2>
+  <pre id="diffText" style="max-height:70vh;overflow:auto"></pre>
+  <div class="actions"><button type="button" data-close>Tutup</button></div>
+</dialog>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const STATUS = { idle: "siap", working: "bekerja", queued: "antre model", waiting_memory: "menunggu RAM",
+  waiting_approval: "minta persetujuan", waiting_command: "antre perintah", waiting_team: "menunggu tim",
+  error: "error", home: "pulang" };
+let state = null, selected = null, es = null, logFor = null;
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+async function api(path, body) {
+  const opts = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json", "X-Kantor": "1" }, body: JSON.stringify(body) };
+  const r = await fetch(path, opts);
+  if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error("login"); }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+function ago(ts) {
+  const s = Math.round(Date.now() / 1000 - ts);
+  return s < 60 ? `${s} dtk` : s < 3600 ? `${Math.round(s / 60)} mnt` : `${Math.round(s / 3600)} jam`;
+}
+
+// --- login -----------------------------------------------------------------------------------
+function showLogin() { $("app").classList.add("hidden"); $("login").classList.remove("hidden"); if (es) es.close(); $("pw").focus(); }
+$("login").onsubmit = async (e) => {
+  e.preventDefault(); $("loginErr").textContent = "";
+  try { await api("/api/login", { password: $("pw").value }); $("pw").value = ""; start(); }
+  catch (err) { $("loginErr").textContent = err.message === "wrong password" ? "Password salah" : err.message; }
+};
+$("logout").onclick = async () => { await api("/api/logout", {}).catch(() => {}); showLogin(); };
+
+// --- state and live events -----------------------------------------------------------------------
+async function start() {
+  try { state = await api("/api/state"); } catch { return; }
+  $("login").classList.add("hidden"); $("app").classList.remove("hidden");
+  renderAll();
+  connect(state.last_event_id);
+}
+function connect(after) {
+  if (es) es.close();
+  es = new EventSource(`/api/events?after=${after}`);
+  es.onopen = () => { $("conn").classList.add("live"); $("connText").textContent = "live"; };
+  es.onerror = () => { $("conn").classList.remove("live"); $("connText").textContent = "menyambung ulang…"; };
+  es.onmessage = (m) => onEvent(JSON.parse(m.data));
+}
+let refreshTimer = null;
+function refreshSoon() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(async () => { try { const s = await api("/api/state"); state = s; renderAll(); } catch {} }, 400);
+}
+function onEvent(ev) {
+  if (ev.kind === "status" && ev.data) {
+    const i = state.workers.findIndex((w) => w.id === ev.data.id);
+    if (ev.data.status === "home") { if (i >= 0) state.workers.splice(i, 1); if (selected === ev.data.id) selected = null; }
+    else if (i >= 0) state.workers[i] = ev.data; else state.workers.push(ev.data);
+    renderWorkers(); renderDetailHead();
+  }
+  if (ev.kind === "approval" || ev.kind === "project") refreshSoon();
+  if (ev.worker && ev.worker === selected && logFor === selected) appendEvent(ev, true);
+}
+setInterval(async () => {
+  if (!state || $("app").classList.contains("hidden")) return;
+  try { const s = await api("/api/state"); state.mem_available_mb = s.mem_available_mb; renderStats(); } catch {}
+}, 15000);
+
+// --- rendering -----------------------------------------------------------------------------------
+function renderAll() { renderStats(); renderApprovals(); renderWorkers(); renderDetailHead(); }
+function renderStats() {
+  const L = state.limits;
+  const busy = state.workers.filter((w) => w.status === "working").length;
+  $("ram").textContent = `RAM bebas ${state.mem_available_mb} MB` + (state.mem_available_mb < L.min_free_mb ? " (di bawah batas, antre)" : "");
+  $("active").textContent = `${state.workers.length}/${L.max_workers} worker · ${busy} bekerja (maks ${L.max_active})`;
+}
+function renderApprovals() {
+  const box = $("approvals"); box.textContent = "";
+  for (const a of state.approvals) {
+    const card = el("div", "approval");
+    const row = el("div", "row");
+    const t = el("div", "title");
+    t.append(el("b", "", a.worker_name), document.createTextNode(a.kind === "command" ? " ingin menjalankan:" : " ingin mengubah file:"));
+    const code = el("pre", "", a.title); code.style.background = "transparent"; code.style.padding = "2px 0"; code.style.margin = "0";
+    t.append(code);
+    const yes = el("button", "primary", "Setujui"), no = el("button", "danger", "Tolak");
+    yes.onclick = () => decide(a.id, true, card); no.onclick = () => decide(a.id, false, card);
+    row.append(t, yes, no); card.append(row);
+    if (a.detail) card.append(diffPre(a.detail));
+    box.append(card);
+  }
+  document.title = state.approvals.length ? `(${state.approvals.length}) Kantor` : "Kantor";
+}
+async function decide(id, approve, card) {
+  card.style.opacity = .5;
+  try { await api(`/api/approvals/${id}`, { approve }); } catch (e) { alert(e.message); }
+  refreshSoon();
+}
+function renderWorkers() {
+  const side = $("side"); side.textContent = "";
+  if (!state.workers.length) side.append(el("div", "empty", "Belum ada worker."));
+  const byParent = {};
+  for (const w of state.workers) (byParent[w.parent || ""] ||= []).push(w);
+  const names = new Set(state.workers.map((w) => w.name));
+  const walk = (key, depth) => {
+    for (const w of (byParent[key] || []).sort((a, b) => a.created - b.created)) {
+      const c = el("div", "card" + (w.id === selected ? " sel" : ""));
+      c.style.marginLeft = `${depth * 16}px`;
+      const top = el("div", "top");
+      top.append(el("span", "name", w.name), el("span", `badge s-${w.status}`, STATUS[w.status] || w.status));
+      c.append(top, el("div", "task", w.task));
+      c.append(el("div", "meta", `${w.model} · ${w.project}${w.branch ? " · " + w.branch : ""}`));
+      c.onclick = () => select(w.id);
+      side.append(c);
+      walk(w.name, depth + 1);
+    }
+  };
+  walk("", 0);
+  // Workers whose hirer went home sit at the top level.
+  for (const key of Object.keys(byParent)) if (key && !names.has(key)) walk(key, 0);
+  renderStats();
+}
+function current() { return state.workers.find((w) => w.id === selected); }
+function renderDetailHead() {
+  const w = current();
+  for (const id of ["head", "log", "send"]) $(id).classList.toggle("hidden", !w);
+  $("noSel").classList.toggle("hidden", !!w);
+  if (!w) return;
+  $("dName").textContent = w.name;
+  $("dStatus").textContent = STATUS[w.status] || w.status;
+  $("dStatus").className = `badge s-${w.status}`;
+  $("dMeta").textContent = `${w.model} · ${w.project} · ${w.branch || "checkout utama"}` + (w.parent ? ` · direkrut oleh ${w.parent}` : "");
+}
+async function select(id) {
+  selected = id; logFor = null; renderWorkers(); renderDetailHead();
+  const log = $("log"); log.textContent = "";
+  try {
+    const events = await api(`/api/workers/${id}/log`);
+    if (selected !== id) return;
+    log.textContent = ""; logFor = id;
+    for (const ev of events) appendEvent(ev, false);
+    log.scrollTop = log.scrollHeight;
+  } catch {}
+}
+function diffPre(text) {
+  const pre = el("pre");
+  for (const line of text.split("\n")) {
+    const span = el("span", line.startsWith("+") && !line.startsWith("+++") ? "ln-add" : line.startsWith("-") && !line.startsWith("---") ? "ln-del" : "", line);
+    pre.append(span, document.createTextNode(span.className ? "" : "\n"));
+  }
+  return pre;
+}
+function folded(summary, body, open) {
+  const d = el("details"); if (open) d.open = true;
+  d.append(el("summary", "", summary), body); return d;
+}
+function appendEvent(ev, live) {
+  const log = $("log");
+  const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  let node = null;
+  switch (ev.kind) {
+    case "user": {
+      const fromWorker = ev.data && ev.data.from && ev.data.from !== "user";
+      node = el("div", "ev user" + (fromWorker ? " from-worker" : ""));
+      node.append(el("div", "from", fromWorker ? `dari ${ev.data.from}` : "kamu"), el("div", "", ev.text));
+      node.style.whiteSpace = "pre-wrap"; break;
+    }
+    case "assistant": node = el("div", "ev assistant", ev.text); break;
+    case "report": node = el("div", "ev report", ev.text); break;
+    case "tool": node = el("div", "ev tool", "· " + ev.text); break;
+    case "result": if (ev.text) node = el("div", "ev", ""), node.append(folded(`hasil ${ev.data?.tool || ""}`, el("pre", "", ev.text))); break;
+    case "command": node = el("div", "ev tool", "$ " + ev.text); break;
+    case "output": node = el("div", "ev"); node.append(folded(`output (exit ${ev.data?.code})`, el("pre", "", ev.text || "(kosong)"))); break;
+    case "diff": node = el("div", "ev"); node.append(folded(`diff ${ev.data?.path || ""}`, diffPre(ev.text), live)); break;
+    case "approval": if (ev.data?.state !== "pending") node = el("div", "ev system", `${ev.data?.state === "approved" ? "disetujui" : "ditolak"}: ${ev.text}`); break;
+    case "error": node = el("div", "ev error", "⚠ " + ev.text); break;
+    case "status": node = el("div", "ev status", `— ${STATUS[ev.text] || ev.text} · ${ago(ev.ts)} lalu —`); break;
+    default: node = el("div", "ev system", ev.text);
+  }
+  if (!node) return;
+  log.append(node);
+  if (stick || !live) log.scrollTop = log.scrollHeight;
+}
+
+// --- actions -------------------------------------------------------------------------------------
+$("send").onsubmit = async (e) => {
+  e.preventDefault();
+  const text = $("msg").value.trim(); if (!text || !selected) return;
+  try { await api(`/api/workers/${selected}/message`, { text }); $("msg").value = ""; } catch (err) { alert(err.message); }
+};
+$("msg").onkeydown = (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("send").requestSubmit(); };
+$("stopBtn").onclick = () => selected && api(`/api/workers/${selected}/stop`, {}).catch((e) => alert(e.message));
+$("homeBtn").onclick = async () => {
+  const w = current(); if (!w) return;
+  if (!confirm(`Pulangkan ${w.name}?` + (w.branch ? "\nWorktree dihapus kalau tidak ada perubahan yang belum di-commit (branch tetap ada)." : ""))) return;
+  try { await api(`/api/workers/${w.id}/home`, { delete_worktree: true }); } catch (e) { alert(e.message); }
+};
+$("diffBtn").onclick = async () => {
+  const w = current(); if (!w) return;
+  $("diffText").textContent = "memuat…"; $("diffDlg").showModal();
+  try { const r = await api(`/api/workers/${w.id}/diff`); $("diffText").replaceWith(Object.assign(diffPre(r.diff), { id: "diffText" })); $("diffText").style.maxHeight = "70vh"; $("diffText").style.overflow = "auto"; }
+  catch (e) { $("diffText").textContent = e.message; }
+};
+document.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => b.closest("dialog").close());
+
+function fillHire() {
+  const p = $("hProject"); p.textContent = "";
+  for (const name of state.projects) p.append(Object.assign(el("option", "", name), { value: name }));
+  const m = $("hModel"); m.textContent = "";
+  for (const [name, desc] of Object.entries(state.models)) {
+    const o = Object.assign(el("option", "", `${name} — ${desc}`), { value: name });
+    if (name === state.default_model) o.selected = true;
+    m.append(o);
+  }
+}
+$("newBtn").onclick = () => { fillHire(); $("hireErr").textContent = ""; $("hireDlg").showModal(); $("hTask").focus(); };
+$("hireForm").onsubmit = async (e) => {
+  e.preventDefault(); $("hireErr").textContent = "";
+  try {
+    const r = await api("/api/workers", { project: $("hProject").value, model: $("hModel").value, name: $("hName").value.trim(), task: $("hTask").value });
+    $("hireDlg").close(); $("hTask").value = ""; $("hName").value = "";
+    state = await api("/api/state"); renderAll(); select(r.id);
+  } catch (err) { $("hireErr").textContent = err.message; }
+};
+$("addProjBtn").onclick = () => { $("projErr").textContent = ""; $("projDlg").showModal(); };
+$("projForm").onsubmit = async (e) => {
+  e.preventDefault(); $("projErr").textContent = "membuat…";
+  try {
+    const r = await api("/api/projects", { name: $("pName").value.trim(), git_url: $("pUrl").value.trim() });
+    state = await api("/api/state"); fillHire(); $("hProject").value = r.name;
+    $("projDlg").close(); $("pName").value = ""; $("pUrl").value = "";
+  } catch (err) { $("projErr").textContent = err.message; }
+};
+
+start();
+</script>
+</body>
+</html>
