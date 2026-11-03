@@ -211,6 +211,11 @@ class Handler(BaseHTTPRequestHandler):
             w = office.hire(str(b.get("project", "")), str(b.get("task", "")), name=b.get("name") or None,
                             model=b.get("model") or None, difficulty=b.get("difficulty") or None)
             return {"id": w.id, "name": w.name, "model": w.model, "note": w.model_note}
+        if path == "/api/settings":
+            if not isinstance(b.get("auto_mode"), bool):
+                raise TeamError("auto_mode is true or false")
+            approved = office.set_auto_mode(b["auto_mode"])
+            return {"auto_mode": office.auto_mode, "approved": approved}
         if path == "/api/projects":
             return {"name": office.add_project(str(b.get("name", "")), (b.get("git_url") or "").strip() or None)}
         m = re.fullmatch(r"/api/approvals/([0-9a-f]{10})", path)

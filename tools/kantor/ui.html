@@ -34,6 +34,15 @@ header { display: flex; align-items: center; gap: 14px; padding: 10px 16px; back
   border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; flex-wrap: wrap; }
 header h1 { font-size: 16px; margin: 0; }
 header .stats { display: flex; gap: 14px; color: var(--muted); font-size: 13px; flex: 1; flex-wrap: wrap; }
+.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; font-size: 13px; }
+.switch input { appearance: none; width: 34px; height: 20px; border-radius: 10px; background: var(--line);
+  position: relative; margin: 0; padding: 0; border: 0; cursor: pointer; transition: background .15s; }
+.switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: #fff; transition: left .15s; }
+.switch input:checked { background: var(--warn); }
+.switch input:checked::after { left: 16px; }
+header.auto-on { box-shadow: inset 0 -3px 0 var(--warn); }
+#autoNote { color: var(--warn); font-size: 12.5px; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
 .live .dot { background: var(--ok); }
 
@@ -127,6 +136,9 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top
       <span id="ram"></span>
       <span id="active"></span>
     </div>
+    <label class="switch" title="Auto: perintah dan edit dijalankan tanpa persetujuan, kecuali perintah berisiko dan model berbayar">
+      <input type="checkbox" id="autoSw"><span>Auto</span><span id="autoNote" class="hidden">tanpa persetujuan</span>
+    </label>
     <button class="primary" id="newBtn">+ Worker</button>
     <button id="logout">Keluar</button>
   </header>
@@ -259,7 +271,8 @@ function onEvent(ev) {
     else if (i >= 0) state.workers[i] = ev.data; else state.workers.push(ev.data);
     renderWorkers(); renderDetailHead();
   }
-  if (ev.kind === "approval" || ev.kind === "project") refreshSoon();
+  if (ev.kind === "settings" && ev.data) { state.auto_mode = ev.data.auto_mode; renderAuto(); }
+  if (ev.kind === "approval" || ev.kind === "project" || ev.kind === "settings") refreshSoon();
   if (ev.worker && ev.worker === selected && logFor === selected) appendEvent(ev, true);
 }
 setInterval(async () => {
@@ -268,7 +281,22 @@ setInterval(async () => {
 }, 15000);
 
 // --- rendering -----------------------------------------------------------------------------------
-function renderAll() { renderStats(); renderApprovals(); renderWorkers(); renderDetailHead(); }
+function renderAll() { renderStats(); renderAuto(); renderApprovals(); renderWorkers(); renderDetailHead(); }
+function renderAuto() {
+  $("autoSw").checked = !!state.auto_mode;
+  document.querySelector("header").classList.toggle("auto-on", !!state.auto_mode);
+  $("autoNote").classList.toggle("hidden", !state.auto_mode);
+}
+$("autoSw").onchange = async (e) => {
+  const on = e.target.checked;
+  if (on && !confirm("Nyalakan Auto mode?\n\nSemua worker akan menjalankan perintah dan mengubah file tanpa persetujuan. "
+      + "Tetap ditanyakan: perintah berisiko (git push, ssh, sudo, rm -rf, dll.)"
+      + (state.auto_mode_paid ? "." : " dan model berbayar."))) { e.target.checked = false; return; }
+  try {
+    const r = await api("/api/settings", { auto_mode: on });
+    state.auto_mode = r.auto_mode; renderAuto(); refreshSoon();
+  } catch (err) { e.target.checked = !on; alert(err.message); }
+};
 function renderStats() {
   const L = state.limits;
   const busy = state.workers.filter((w) => w.status === "working").length;
@@ -284,6 +312,7 @@ function renderApprovals() {
     const t = el("div", "title");
     const what = { command: " ingin menjalankan:", edit: " ingin mengubah file:", paid_model: " 💰 minta model BERBAYAR:" }[a.kind] || ":";
     t.append(el("b", "", a.worker_name), document.createTextNode(what));
+    if (a.risky) t.append(el("div", "s-waiting_approval", `⚠ berisiko: ${a.risky}`));
     const code = el("pre", "", a.title); code.style.background = "transparent"; code.style.padding = "2px 0"; code.style.margin = "0";
     t.append(code);
     const yes = el("button", "primary", "Setujui"), no = el("button", "danger", "Tolak");
@@ -380,7 +409,11 @@ function appendEvent(ev, live) {
     case "command": node = el("div", "ev tool", "$ " + ev.text); break;
     case "output": node = el("div", "ev"); node.append(folded(`output (exit ${ev.data?.code})`, el("pre", "", ev.text || "(kosong)"))); break;
     case "diff": node = el("div", "ev"); node.append(folded(`diff ${ev.data?.path || ""}`, diffPre(ev.text), live)); break;
-    case "approval": if (ev.data?.state !== "pending") node = el("div", "ev system", `${ev.data?.state === "approved" ? "disetujui" : "ditolak"}: ${ev.text}`); break;
+    case "approval": {
+      const label = { approved: "disetujui", denied: "ditolak", auto: "auto disetujui" }[ev.data?.state];
+      if (label) node = el("div", "ev system", `${label}: ${ev.text}`);
+      break;
+    }
     case "error": node = el("div", "ev error", "⚠ " + ev.text); break;
     case "warning": node = el("div", "ev warning", "⚠ " + ev.text); break;
     case "notice": case "model": node = el("div", "ev notice", "ℹ " + ev.text); break;

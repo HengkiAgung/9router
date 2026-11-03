@@ -67,6 +67,26 @@ UNSAFE_ARGS = {"-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint", "-fpr
 HEAVY_RX = re.compile(r"\b(npm|npx|pnpm|yarn|bun|node|next|vite|tsc|webpack|pip3?|poetry|uv|docker|"
                       r"cargo|go|mvn|gradle|make|composer|php|pytest)\b")
 
+# Commands that still wait for the user in auto mode, with the reason shown on the approval.
+RISKY_COMMANDS = [
+    (r"/var/lib/kantor|kantor\.db|/proc/[^\s]*/environ", "touches Kantor's own state or secrets"),
+    (r"\bgit\s+push\b", "pushes to another machine"),
+    (r"\b(ssh|scp|sftp)\b|\brsync\b[^\n]*:", "reaches another machine"),
+    (r"\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(sh|bash|zsh|python3?)\b", "runs a downloaded script"),
+    (r"\brm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+(-[a-zA-Z]+\s+)*(/|~|\$HOME|\*|\.\.?/?)(\s|$)", "deletes a whole tree"),
+    (r"\b(sudo|su|systemctl|crontab|shutdown|reboot|mkfs|pkill|killall)\b|\bdd\s+if=|\bkill\s+-9\s+-1\b",
+     "system-level command"),
+    (r"\bchmod\s+(-R\s+)?[0-7]*7[0-7]*\s+/|\bchown\b", "changes permissions or owners"),
+]
+
+
+def risky_reason(command: str) -> str | None:
+    for pattern, reason in RISKY_COMMANDS:
+        if re.search(pattern, command):
+            return reason
+    return None
+
+
 MAX_HISTORY_CHARS = 400_000
 EVENT_TEXT_LIMIT = 20_000
 
@@ -124,7 +144,9 @@ class Config:
         self.min_free_mb = num("KANTOR_MIN_FREE_MB", 250)
         self.max_steps = num("KANTOR_MAX_STEPS", 40)
         self.auto_edit = flag("KANTOR_AUTO_EDIT", True)
+        # Auto mode's starting value; the switch in the UI overrides it from then on.
         self.auto_approve = flag("KANTOR_AUTO_APPROVE_COMMANDS", False)
+        self.auto_mode_paid = flag("KANTOR_AUTO_MODE_PAID", False)
         self.data_dir = Path(env.get("KANTOR_DATA_DIR") or Path.home() / ".kantor")
         self.projects_dir = Path(env.get("KANTOR_PROJECTS_DIR") or Path.home() / "projects")
         def models(key: str, default: str) -> list[str]:
@@ -191,6 +213,7 @@ class Store:
               kind text, text text, data text);
             create index if not exists events_worker on events(worker, id);
             create table if not exists sessions(hash text primary key, expires real);
+            create table if not exists settings(key text primary key, value text);
         """)
         for column in ("usage text", "last_model text"):  # added after the first release
             try:
@@ -252,7 +275,7 @@ class KantorWorkspace(Workspace):
         diff = "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True), f"a/{path}", f"b/{path}"))
         office = self.worker.office
         office.events.emit(self.worker.id, "diff", diff, {"path": path})
-        return self.auto_edit or office.request_approval(self.worker, "edit", f"Edit {path}", diff)
+        return self.auto_edit or office.auto_mode or office.request_approval(self.worker, "edit", f"Edit {path}", diff)
 
     def run_command(self, command: str, timeout: int = 120) -> str:
         office, worker = self.worker.office, self.worker
@@ -261,8 +284,10 @@ class KantorWorkspace(Workspace):
         except (TypeError, ValueError):
             timeout = 120
         office.events.emit(worker.id, "command", command)
-        if not (office.cfg.auto_approve or is_safe_command(command)):
-            if not office.request_approval(worker, "command", command, f"in {self.root}"):
+        risky = risky_reason(command)
+        if not (is_safe_command(command) or (office.auto_mode and not risky)):
+            detail = f"in {self.root}" + (f"\nHeld even in auto mode: {risky}" if risky and office.auto_mode else "")
+            if not office.request_approval(worker, "command", command, detail, risky=risky):
                 return "DENIED: the user rejected this command"
         heavy = bool(HEAVY_RX.search(command))
         gate = office.heavy_gate if heavy else office.light_gate
@@ -604,6 +629,8 @@ class Office:
         self.light_gate = threading.BoundedSemaphore(cfg.max_commands)
         self.heavy_gate = threading.BoundedSemaphore(cfg.max_heavy)
         self.approvals: dict[str, dict] = {}
+        saved = self.db.q("select value from settings where key = 'auto_mode'")
+        self._auto_mode = saved[0][0] == "1" if saved else cfg.auto_approve
         self.workers: dict[str, Worker] = {}
         cfg.projects_dir.mkdir(parents=True, exist_ok=True)
         self._load()
@@ -655,6 +682,8 @@ class Office:
             "limits": {"max_workers": self.cfg.max_workers, "max_active": self.cfg.max_active,
                        "max_commands": self.cfg.max_commands, "max_heavy": self.cfg.max_heavy,
                        "max_depth": self.cfg.max_depth, "min_free_mb": self.cfg.min_free_mb},
+            "auto_mode": self._auto_mode,
+            "auto_mode_paid": self.cfg.auto_mode_paid,
             "mem_available_mb": mem_available_mb(),
             "last_event_id": self.events.last_id,
         }
@@ -761,13 +790,46 @@ class Office:
             return cfg.tiers[difficulty], f"judged {difficulty} -> {cfg.tiers[difficulty]}"
         return cfg.tiers[difficulty], f"{difficulty} -> {cfg.tiers[difficulty]}"
 
-    def request_approval(self, worker: Worker, kind: str, title: str, detail: str) -> bool:
+    # --- auto mode -------------------------------------------------------------------------------
+
+    @property
+    def auto_mode(self) -> bool:
+        return self._auto_mode
+
+    def _auto_approves(self, public: dict) -> bool:
+        if not self._auto_mode:
+            return False
+        if public["kind"] == "paid_model":
+            return self.cfg.auto_mode_paid
+        return not public.get("risky")
+
+    def set_auto_mode(self, on: bool) -> int:
+        """Switch auto mode for every worker; turning it on also approves what is already waiting
+        (except risky commands and, unless KANTOR_AUTO_MODE_PAID, paid models). Returns how many."""
+        self._auto_mode = bool(on)
+        self.db.q("insert or replace into settings(key, value) values ('auto_mode', ?)", ("1" if on else "0",))
+        approved = 0
+        for aid, entry in list(self.approvals.items()):
+            if self._auto_approves(entry["public"]):
+                entry["approved"] = True
+                entry["event"].set()
+                approved += 1
+        self.events.emit(None, "settings", f"auto mode {'on' if on else 'off'}",
+                         {"auto_mode": self._auto_mode, "approved": approved})
+        return approved
+
+    def request_approval(self, worker: Worker, kind: str, title: str, detail: str, risky: str | None = None) -> bool:
         aid = uuid.uuid4().hex[:10]
         decided = threading.Event()
         public = {"id": aid, "worker": worker.id, "worker_name": worker.name, "kind": kind,
-                  "title": clip(title, 2000), "detail": clip(detail, EVENT_TEXT_LIMIT), "ts": time.time()}
+                  "title": clip(title, 2000), "detail": clip(detail, EVENT_TEXT_LIMIT), "ts": time.time(),
+                  "risky": risky}
         entry = {"public": public, "event": decided, "approved": False}
-        self.approvals[aid] = entry
+        self.approvals[aid] = entry  # listed before the check, so a switch flipped meanwhile still sees it
+        if self._auto_approves(public):
+            self.approvals.pop(aid, None)
+            self.events.emit(worker.id, "approval", title, {"approval": public, "state": "auto"})
+            return True
         before = worker.status
         worker.set_status("waiting_approval")
         self.events.emit(worker.id, "approval", title, {"approval": public, "state": "pending"})
